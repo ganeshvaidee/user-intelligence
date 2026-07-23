@@ -1,6 +1,6 @@
 # User Intelligence
 
-An IT-security agentic workflow: Claude reads **skills** (natural-language rules) and calls **MCP tools** (database operations) to look up users, assess risk, and offboard accounts. All model calls go through AWS Bedrock.
+An IT-security agentic workflow: Claude reads **skills** (natural-language rules) and calls **MCP tools** (database operations) to look up users, assess risk, and offboard accounts. Model calls go through either the direct Anthropic API or AWS Bedrock — see [Model access](#3-model-access) below.
 
 ## How it works
 
@@ -34,9 +34,35 @@ pip install -r mcp-server/requirements.txt
 python seed/seed.py
 ```
 
-### 3. AWS credentials
+### 3. Model access
 
-Add your credentials to `~/.aws/credentials` under the `default` profile with Bedrock access to `us.anthropic.claude-sonnet-4-6` in `us-west-2`.
+`flows/llm_client.py` picks the model backend based on the `LLM_PROVIDER` env var. Two options:
+
+#### Option A — Direct Anthropic API (default)
+
+Used when `LLM_PROVIDER` is unset or anything other than `bedrock`. Reads `flows/anthropic_client.py`, model default `claude-sonnet-4-6` (override with `ANTHROPIC_MODEL_ID`).
+
+Authenticate with one of:
+
+- **API key** — get one from `console.anthropic.com`, then set:
+  ```bash
+  export ANTHROPIC_API_KEY=sk-ant-...
+  ```
+- **Your Claude account (OAuth)** — install the `ant` CLI, then:
+  ```bash
+  ant auth login
+  ```
+  This opens a browser to sign in and stores a profile locally — no env var needed. Don't set `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` alongside this; either one takes precedence over the OAuth profile and will shadow it.
+
+#### Option B — AWS Bedrock
+
+Set `LLM_PROVIDER=bedrock` to route through `flows/bedrock_client.py` instead:
+
+```bash
+export LLM_PROVIDER=bedrock
+```
+
+Add your AWS credentials to `~/.aws/credentials` under the `default` profile with Bedrock access to `us.anthropic.claude-sonnet-4-6` in `us-west-2`. Override the model with `BEDROCK_MODEL_ID`.
 
 ---
 
