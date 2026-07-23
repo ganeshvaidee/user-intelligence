@@ -1,0 +1,600 @@
+# AI / Claude Concepts Used in This Project
+
+## TODOs — Concepts to Explore Next (Evals)
+
+- [ ]  **LLM-as-Judge for response quality** — instead of keyword matching (`"MFA" in response`), use a second Claude call to evaluate whether the response is accurate, well-justified, and actionable. More robust than string checks against non-deterministic output.
+- [x]  **Score accuracy evals** — `extract_risk_score` + `assert_score_in_range` added to `tests/test_flows.py`. Handles multiple formatting variants. Single-agent tests use dual-path fallback (score or keyword); parallel agent tests enforce score strictly.
+- [x]  **Regression suite on skill changes** — implemented via Claude Code hooks. See Hooks in Done section and `docs/improvements/hooks.md`.
+- [ ]  **Golden dataset** — a fixed set of (request, expected_tools_called, expected_score_range, expected_keywords) tuples that cover all users and all flow types. Currently tests are hand-written per scenario; a dataset makes coverage gaps visible.
+- [ ]  **Consistency evals** — run the same request N times and check that scores and tool call sequences are stable. LLM outputs are non-deterministic; high variance on the same input is a signal the skill instructions are ambiguous.
+
+---
+
+## Done
+
+- [X]  **Prompt Caching** — see concept 8 below and `docs/improvements/prompt-caching.md`.
+- [X]  **Streaming** — see concept 9 below and `docs/improvements/streaming.md`.
+- [X]  **Multi-Agent (Parallel Subagents)** — see concept 10 below and `docs/improvements/multi-agent-parallel.md`.
+- [X]  **Extended Thinking** — see concept 11 below and `docs/improvements/extended-thinking.md`. **Only used in options 8 and 9 (parallel agents + extended thinking).**
+- [X]  **Memory / Persistence** — see concept 12 below and `docs/improvements/memory-persistence.md`. **Only used in option 9 (parallel + extended thinking + memory).**
+- [x]  **Hooks** — see `docs/improvements/hooks.md`. PostToolUse hook runs the eval suite automatically after any SKILL.md edit.
+- [x]  **Human-in-the-Loop** — see concept 13 below and `docs/improvements/human-in-the-loop.md`. Two-phase offboarding with client-owned confirmation gate.
+
+---
+
+## TODOs — Other Concepts to Explore
+
+- [ ]  **Batch Processing** — use the Anthropic Batch API to run risk assessments on a list of users (e.g. all contractors) in parallel rather than serially. Useful for bulk audits.
+- [x]  **Human-in-the-Loop (Interrupts)** — see `docs/improvements/human-in-the-loop.md`. Two-phase offboarding: Phase 1 assesses and flags, client presents summary and waits for human CONFIRM, Phase 2 deactivates.
+- [x]  **Hooks** — see `docs/improvements/hooks.md`.
+
+---
+
+## 1. Evals (Evaluation Testing)
+
+The project has an eval suite in `tests/test_flows.py` that tests the full end-to-end pipeline — not unit tests of Python functions, but tests of Claude's behaviour given a real user request.
+
+Three types of assertions are used:
+
+**Tool call assertions** — did Claude call the right tools?
+
+```python
+assert_tools_called(tools, ["get_user_activity", "get_user_permissions"])
+assert_tools_not_called(tools, ["deactivate_user"])  # safety check
+```
+
+**Response content assertions** — does the output contain expected content?
+
+```python
+assert_response_contains(response, ["Alice", "alice@company.com", "Engineering"])
+assert_response_not_contains(response, ["deactivate", "immediate"])
+```
+
+**Safety rule assertions** — were the skill safety rules followed?
+
+```python
+# flag_user must be called before deactivate_user, never after
+if tools.index("flag_user") > tools.index("deactivate_user"):
+    failures.append("SAFETY VIOLATION: deactivate_user called before flag_user")
+```
+
+Each test runs a real flow against the real MCP server and real Bedrock — no mocking. This catches the failure mode where mocked tests pass but real Claude behaviour diverges from what the skill intended.
+
+Tests cover: lookup by ID, lookup by email, MFA warning surfacing, high-risk scoring, low-risk scoring, confirmation gate enforcement, inactive user handling, and the flag-before-deactivate safety rule.
+
+---
+
+## 2. Tool Use (Function Calling)
+
+Claude is given a list of tool schemas (`USER_TOOLS`) and decides which to call, with what arguments, and in what order. The core Claude capability — instead of answering from training data, it calls real functions to get live data.
+
+The tools are defined twice: as FastMCP `@mcp.tool()` decorators (for the MCP protocol) and as Anthropic JSON schemas (for the Bedrock API call). Claude sees the JSON schemas; the MCP server executes the actual Python.
+
+```python
+# What Claude sees (flows/tools.py)
+USER_TOOLS = [
+    {
+        "name": "get_user",
+        "description": "Fetch a user record by ID. Returns name, email, status...",
+        "input_schema": { "type": "object", "properties": { "user_id": {...} } }
+    },
+    ...
+]
+
+# What actually runs (mcp-server/server.py)
+@mcp.tool()
+def get_user(user_id: str) -> dict:
+    return fetch_user(user_id)
+```
+
+---
+
+## 3. Agentic Loop
+
+Claude doesn't answer in one shot. It runs in a loop — call Bedrock, execute tools, feed results back, call Bedrock again — until it decides it has enough information (`stop_reason == "end_turn"`). Claude drives the loop; the code just dispatches whatever Claude returns.
+
+```
+while True:
+    response = call Bedrock(messages, tools)
+
+    for block in response:
+        if tool_use → execute tool → collect result
+        if text     → accumulate
+
+    if stop_reason == "end_turn" → break
+    append tool results to messages → loop again
+```
+
+Claude decides which tools to call, in what order, and when to stop. The loop has no exit condition based on data — only on Claude's signal.
+
+---
+
+## 4. Skills (System Prompt Engineering)
+
+Skills are Markdown files injected into Claude's system prompt. They tell Claude *what steps to follow*, *what rules to apply*, and *what output format to produce* — without any Python logic. The skill instructs; the tool executes.
+
+Skills compose via dependency order — each skill builds on the ones before it:
+
+```
+_base                     ← shared: error handling, output format, safety rules
+  └── lookup-user         ← fetch + summarise a user record
+        └── user-risk-profile   ← score across 4 risk dimensions
+              └── offboard-user ← lookup → risk → flag → confirm → deactivate
+```
+
+Loading order matters — always load `_base` first:
+
+```python
+load_skill("_base", "lookup-user", "user-risk-profile")
+# → concatenated into Claude's system prompt
+```
+
+The skill files also double as **prompts** in Claude Desktop via `@mcp.prompt()`, appearing in the prompt picker so users can select the right skill before asking a question.
+
+---
+
+## 5. MCP (Model Context Protocol)
+
+The MCP server exposes database operations as tools Claude can call. It supports two transports:
+
+
+| Transport       | When used                                                                  |
+| --------------- | -------------------------------------------------------------------------- |
+| stdio           | Claude Desktop, all-in-one CLI — server spawned as subprocess             |
+| streamable-HTTP | Three-service mode — server runs independently, client connects over HTTP |
+
+The client (`tools.py`) opens an MCP session, dispatches Claude's `tool_use` blocks to it via `session.call_tool()`, and returns results — Claude never touches the database directly.
+
+```
+Claude decides to call get_user("usr_005")
+  → execute_tool(session, "get_user", {"user_id": "usr_005"})
+    → session.call_tool(...)   ← MCP protocol
+      → server.py get_user()
+        → database.py fetch_user()
+          → SQLite
+```
+
+The client switches transport based on the `MCP_URL` environment variable — if set, HTTP; if unset, stdio subprocess.
+
+---
+
+## 6. LLM-as-Judge (Structured Output via `tool_choice`)
+
+Two separate LLM calls act as judges — not to answer the user, but to evaluate Claude's own output:
+
+
+| Judge        | Function                | Question it answers                                        |
+| ------------ | ----------------------- | ---------------------------------------------------------- |
+| Completeness | `_check_completeness()` | "Did the response cover everything the request asked for?" |
+| Critic       | `_critique_response()`  | "Are there errors, unjustified claims, or gaps?"           |
+
+Both use `tool_choice={"type": "any"}` to force structured output instead of prose. This is a key pattern — the judge is forced to call a tool so the result is always a parseable dict, with no fragile string extraction:
+
+```python
+result = await client.messages.create(
+    tools       = [_COMPLETENESS_TOOL],
+    tool_choice = {"type": "any"},   # Claude MUST call the tool, not write prose
+    ...
+)
+# always returns: {"complete": bool, "missing": [...]}
+return next(b for b in result.content if b.type == "tool_use").input
+```
+
+---
+
+## 7. Multi-turn Conversation (Stateful Context)
+
+The `msgs` list grows across tool-use rounds within a single flow. Every tool call Claude made and every result it received stays in context. Claude can see its full history and does not re-fetch data it already has.
+
+```
+msgs after two tool rounds:
+[
+  {user:      "Give me a risk assessment for usr_005"},
+  {assistant: [ToolUseBlock(get_user)]},
+  {user:      [tool_result: {...user data...}]},
+  {assistant: [ToolUseBlock(get_user_activity), ToolUseBlock(get_user_permissions)]},
+  {user:      [tool_result: {...activity...}, tool_result: {...permissions...}]},
+  {assistant: [TextBlock("## Risk Assessment...")]},
+]
+```
+
+In the convergence loop, conversation state accumulates across multiple rounds — so Round 2 only fetches what Round 1 missed, not everything again. In the critic-revise pattern, the revision phase continues the same thread so Claude can correct its answer without any additional tool calls.
+
+---
+
+## 8. Prompt Caching
+
+Every call to `client.messages.create` sends the full system prompt (skills content) and the full `USER_TOOLS` list. In a 3-round convergence flow, the same ~3KB of skills text and ~2KB of tool schemas is processed by the model on every single Bedrock call — wasting tokens and adding latency.
+
+Prompt caching marks static content with `cache_control: {type: ephemeral}` so Bedrock processes it once and serves subsequent calls from cache at ~90% lower token cost. The cache lives for 5 minutes — long enough to cover all rounds in a single flow.
+
+### What is cached
+
+**System prompt** — the skills content is identical across all rounds within a flow. Converted from a plain string to a content block with a cache breakpoint:
+
+```python
+system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+```
+
+**Tools list** — `USER_TOOLS` never changes within a flow. The cache breakpoint is added to the last tool entry at the point of the API call, not in the list definition:
+
+```python
+cached_tools = [*USER_TOOLS[:-1], {**USER_TOOLS[-1], "cache_control": {"type": "ephemeral"}}]
+```
+
+The API caches everything up to and including the tool with the breakpoint.
+
+**Judge system prompts** — `_check_completeness` and `_critique_response` also cache their static system strings. Low individual gain but correct practice — the system prompt is cached after the first judge call and served from cache in any subsequent rounds.
+
+### Cache hit pattern
+
+```
+Round 1, Call 1:  system + tools → processed and cached
+Round 1, Call 2+: system + tools → served from cache ✓
+Round 2, Call 1:  system + tools → cache still warm, served from cache ✓
+Round 2, Call 2+: system + tools → served from cache ✓
+```
+
+In a 3-round convergence flow with 3 Bedrock calls per round, 8 of 9 calls are cache hits on the system prompt and tools — the most expensive tokens in each request.
+
+### Where the changes live
+
+- `flows/run_flow.py` — `_run_tool_loop()`: system prompt and tools
+- `flows/tools.py` — `_check_completeness()` and `_critique_response()`: judge system prompts
+
+No other files changed. Caching is transparent — it has no effect on Claude's output, only on cost and latency.
+
+See `docs/improvements/prompt-caching.md` for the full design.
+
+---
+
+## 9. Streaming
+
+Before streaming, every Bedrock call blocked until Claude finished the entire response. For a 20–30 second risk assessment the user saw nothing, then received everything at once. Streaming delivers text tokens as Claude generates them.
+
+Two surfaces are implemented:
+
+**Verbose CLI mode** (`_run_tool_loop`, `verbose=True`) — switches from `client.messages.create()` to `client.messages.stream()` and prints each token immediately as it arrives. Tool call logging still appears between rounds.
+
+**Orchestrator SSE endpoint** (`/flow/stream`) — a new FastAPI endpoint backed by the `run_flow_stream` async generator. Yields SSE events token by token; the client consumes them and prints to the terminal in real time.
+
+```
+data: {"text": "## Risk Assessment"}\n\n
+data: {"text": " — Eve Contractor (usr_005)"}\n\n
+...
+data: {"done": true}\n\n
+```
+
+The key pattern — `stream.text_stream` yields text tokens, `stream.get_final_message()` returns the complete message for tool processing:
+
+```python
+async with client.messages.stream(...) as stream:
+    async for text in stream.text_stream:
+        yield text                          # stream to caller
+    response = await stream.get_final_message()  # process tool calls from final message
+```
+
+All three flow types stream. Judge and critic calls run silently between rounds — only Claude's text reaches the client.
+
+
+| Mode                                | Streaming?                     |
+| ----------------------------------- | ------------------------------ |
+| All-in-one CLI, verbose=True        | ✅ tokens printed as generated |
+| Three-service client, any flow_type | ✅ SSE from`/flow/stream`      |
+
+See `docs/improvements/streaming.md` for the full design.
+
+---
+
+## 10. Multi-Agent Parallel Risk Scoring
+
+The single-agent risk assessment scores all four dimensions (Authentication, Permissions, Behaviour, Account) sequentially in one conversation. Each dimension has entirely disjoint data requirements — there is no reason for them to wait on each other.
+
+This concept fans out to **four independent Claude agents**, one per dimension, running concurrently via `asyncio.gather`. Each agent:
+
+- Opens its own MCP session
+- Sees only the MCP tools its dimension needs (scoped tool sets)
+- Fetches its own data and applies its scoring rules
+- Returns a structured score by calling a `report_dimension_score` tool (same `tool_choice`-style pattern as the LLM judges)
+
+Pure Python synthesizes the final report — no coordinator LLM call needed.
+
+```
+asyncio.gather(
+    run_dimension_agent("auth",        user_id)  ← get_user + get_user_activity
+    run_dimension_agent("permissions", user_id)  ← get_user + get_user_permissions
+    run_dimension_agent("behaviour",   user_id)  ← get_user_activity
+    run_dimension_agent("account",     user_id)  ← get_user + get_audit_log
+)
+→ _synthesize_risk_report(auth, perms, behav, acct)   ← pure Python
+```
+
+**Structured output per agent:** each agent calls `report_dimension_score` as its final action, returning `{score, max_score, factors, evidence}`. No text parsing — the result is a dict captured directly from the tool_use block, the same pattern used by `_check_completeness` and `_critique_response`.
+
+**Skill scoping:** four new `SKILL.md` files under `skills/risk-{dimension}/`, each containing only the scoring rules and tool instructions for that dimension. Agents can't drift into other dimensions' logic.
+
+**New flow:** `run_flow_parallel_risk(user_id)` — available as option 7 in the CLI, `flow_type="risk-parallel"` in the orchestrator, and wired through `/flow/stream`.
+
+See `docs/improvements/multi-agent-parallel.md` for the full design.
+
+---
+
+## Orchestration Patterns (Coding Patterns)
+
+These are not AI concepts — they are coding patterns built on top of the AI concepts above. They compose the agentic loop, LLM-as-judge, multi-turn conversation, and multi-agent primitives into reusable flow functions.
+
+### Single Shot (`run_flow`)
+
+Plain agentic loop. Claude calls tools until it decides it's done.
+
+```
+user request → [agentic loop] → response
+```
+
+### Convergence Loop (`run_flow_until_complete`)
+
+After each round a completeness judge checks whether the response fully covered the request. If not, missing items are fed back and Claude runs another pass in the same conversation thread.
+
+```
+round 1: [agentic loop] → response
+         → completeness judge → {complete: false, missing: ["audit log"]}
+         → "Your response is incomplete. Please also check: ..."
+round 2: [agentic loop continues same conversation] → response
+         → completeness judge → {complete: true} → done
+```
+
+### Critic-Revise (`run_flow_with_reflection`)
+
+Runs the full agentic loop once, then a critic LLM reviews the output. If issues are found, Claude revises in the same conversation thread — retaining all prior tool results without re-fetching.
+
+```
+phase 1: [agentic loop] → initial response
+phase 2: critic LLM → {has_issues: true, issues: [...]}
+phase 3: [agentic loop continues same conversation] → revised response
+```
+
+### Parallel Risk (`run_flow_parallel_risk`)
+
+Fans out to four dimension agents concurrently, synthesizes with pure Python.
+
+```
+asyncio.gather(auth agent, permissions agent, behaviour agent, account agent)
+→ _synthesize_risk_report()
+```
+
+### Comparison
+
+
+|                   | `run_flow`    | `run_flow_until_complete` | `run_flow_with_reflection`   | `run_flow_parallel_risk`          |
+| ----------------- | ------------- | ------------------------- | ---------------------------- | --------------------------------- |
+| Extra LLM calls   | None          | 1 judge/round             | 1 critic + optional revision | 4 agents concurrent               |
+| Self-correction   | None          | Completeness gap-filling  | Error/claim verification     | Independent per-dimension         |
+| MCP sessions      | 1             | 1 per round               | 1 shared                     | 4 concurrent                      |
+| Extended Thinking | ❌            | ❌                        | ❌                           | ✅ per dimension agent            |
+| Use when          | Task is clear | Thoroughness matters      | Accuracy matters             | Risk scoring speed + auditability |
+
+---
+
+## 11. Extended Thinking
+
+> **Scope: Option 7 only** (`run_flow_parallel_risk` → `run_dimension_agent`). Options 1–6 do not use extended thinking.
+
+Extended Thinking enables Claude to reason step-by-step *before* producing its final output. The thinking is returned as a separate `ThinkingBlock` alongside the response. For risk scoring, this makes the scoring logic auditable — you can see exactly which conditions Claude evaluated, what the data showed, and why each triggered (or didn't).
+
+**Without extended thinking** (options 1–6): Claude reads the data and produces a score. The reasoning is implicit — you see `Authentication: 6/6` but not how Claude counted the failed logins or whether it applied the right threshold.
+
+**With extended thinking** (option 7): Claude thinks through each condition explicitly before calling `report_dimension_score`:
+
+```
+[THINKING — AUTH]
+MFA disabled → +2.
+Failed logins: 15 out of 60 events in 30 days. 15 > 10 threshold → +2.
+Unique IPs in 7 days: 8. 8 > 5 threshold → +2.
+Last login: recent. Dormant condition not met → +0.
+Total: 6/6.
+```
+
+### How it works
+
+The `thinking` parameter is added to the Bedrock call in `run_dimension_agent`:
+
+```python
+response = await client.messages.create(
+    model      = BEDROCK_MODEL_ID,
+    max_tokens = 10000,                                  # must exceed budget_tokens
+    thinking   = {"type": "enabled", "budget_tokens": 8000},
+    system     = cached_system,
+    tools      = cached_tools,
+    messages   = messages,
+)
+```
+
+`ThinkingBlock`s in the response are logged in verbose mode and skipped for tool routing — only `tool_use` blocks are dispatched to the MCP server.
+
+### Where to see it
+
+**All-in-one CLI** (`python flows/run_flow.py` → option 7, verbose=True): thinking blocks print as `[THINKING — AUTH]`, `[THINKING — PERMISSIONS]` etc. before each agent's score.
+
+**Three-service mode** (client → orchestrator → option 7): thinking is not forwarded over SSE, but the synthesized report always includes an **Agent Reasoning** section — a one-sentence summary each agent writes after thinking, captured via the required `reasoning` field in `report_dimension_score`:
+
+```
+### Agent Reasoning
+- **Authentication:** No MFA on a contractor account with 15 failed logins from 8 external IPs
+- **Permissions:** Admin DB access combined with contractor status
+- **Behaviour:** 25% failure rate exceeds 20% threshold; accessed secrets and admin-panel
+- **Account:** Contractor type only — not flagged, not new
+```
+
+### Skill guidance
+
+Each dimension skill file (`skills/risk-{dimension}/SKILL.md`) has a "How to use your thinking" section that instructs Claude to evaluate each condition explicitly with exact numbers before reporting — guiding the thinking budget toward systematic condition-checking rather than free-form prose.
+
+See `docs/improvements/extended-thinking.md` for the full design.
+
+---
+
+## 12. Memory / Persistence
+
+> **Scope: Option 9 only** (`run_flow_parallel_risk_with_memory`). Options 1–8 do not persist or retrieve prior assessments.
+
+Every risk assessment previously started cold — Claude had no awareness of whether it had assessed the same user before or whether the risk profile was trending up or down. Memory adds continuity: each completed assessment is saved to the database, and the next run retrieves it before launching the agents. Pure Python computes the delta and adds a comparison section to the report.
+
+**No skill changes needed.** The memory fetch and save are Python-driven via MCP tool calls — not instructions to Claude. The agents score their dimensions independently (unchanged from option 7/8); only the synthesis step sees the prior result.
+
+### How it works
+
+```
+run_flow_parallel_risk_with_memory(user_id)
+    │
+    ├── MCP → get_prior_assessment(user_id)   ← Python fetches, agents don't know
+    │
+    ├── asyncio.gather(4 dimension agents with extended thinking)
+    │
+    ├── _synthesize_risk_report(..., prior=prior)   ← comparison section added
+    │
+    └── MCP → save_assessment(user_id, scores...)   ← persisted for next run
+```
+
+### New MCP tools
+
+Two new tools added to the MCP server and `USER_TOOLS`:
+
+
+| Tool                                         | What it does                                                       |
+| -------------------------------------------- | ------------------------------------------------------------------ |
+| `get_prior_assessment(user_id)`              | Returns last saved assessment dict, or`{none: true}` if first time |
+| `save_assessment(user_id, total_score, ...)` | Writes current scores + level + summary to`assessments` table      |
+
+### What the output looks like
+
+**First run** — baseline message at the bottom:
+
+```
+### Prior Assessment
+None — this is the baseline assessment. Scores will be compared on the next run.
+```
+
+**Subsequent runs** — delta comparison:
+
+```
+### Change Since Prior Assessment
+Prior: 13/18 (🔴 Critical) on 2026-06-24
+Current: 16/18 — overall change: **+3**
+- Authentication: ↑ 2 points
+- Behaviour: ↑ 1 point
+```
+
+### Database
+
+New `assessments` table in `seed/users.db` (created with `IF NOT EXISTS` so existing DBs don't need re-seeding). Stores per-dimension scores, total, risk level, and a one-sentence summary sourced from the agents' `reasoning` field.
+
+See `docs/improvements/memory-persistence.md` for the full design.
+
+---
+
+## 13. Human-in-the-Loop
+
+> **Scope: Option 3 (Full offboarding) only.** All other flows are fully automated.
+
+The original offboard skill had a confirmation gate inside the flow — Claude would ask "Type CONFIRM to proceed." This works in the all-in-one CLI (interactive stdin) but fails in the three-service mode where the orchestrator is blocking on an HTTP request with no way for the human to respond mid-flow.
+
+The fix: split offboarding into two separate, stateless API calls with the client owning the human pause in between.
+
+### How it works
+
+```
+Client → POST /offboard/prepare/stream
+             Claude: lookup → risk → flag → return summary
+         ← streaming report (risk score, permissions, last login)
+
+Client presents summary to human
+Human reviews and types CONFIRM (or cancels)
+
+Client → POST /offboard/confirm/stream   (only if CONFIRM)
+             Claude: deactivate_user → return completion
+         ← streaming completion report
+```
+
+**The orchestrator is stateless.** No session, no queue, no mid-flow pausing. The only state between phases is `user_id` and `reason` — held in local variables in the client. The DB flag applied in Phase 1 is the durable state: if the human cancels, the account stays flagged as a security signal.
+
+### Two new skills
+
+| Skill | Steps | STOP condition |
+|---|---|---|
+| `offboard-prepare` | Lookup → risk → flag | Stops after flagging — explicitly told not to deactivate |
+| `offboard-confirm` | Deactivate only | Human confirmed; proceeds directly |
+
+### Two new orchestrator endpoints
+
+```
+POST /offboard/prepare/stream  →  Phase 1 SSE stream
+POST /offboard/confirm/stream  →  Phase 2 SSE stream
+```
+
+Both take `{user_id, reason}` — not the generic `{user_request, skill_names}` — since the skills are fixed for these endpoints.
+
+### Client as the agent
+
+The client is the human-facing layer — it owns the confirmation gate:
+
+```python
+call_offboard_phase_stream("/offboard/prepare/stream", user_id, reason)  # Phase 1
+
+response = input("Type CONFIRM to deactivate: ").strip()
+if response.upper() != "CONFIRM":
+    print("Cancelled. Account remains flagged.")
+    return
+
+call_offboard_phase_stream("/offboard/confirm/stream", user_id, reason)   # Phase 2
+```
+
+The existing `offboard-user` skill and single-phase flow are unchanged — backward compatible for direct `run_flow` calls.
+
+See `docs/improvements/human-in-the-loop.md` for the full design.
+
+---
+
+## Deployment Modes: claude.ai vs Claude Desktop vs Python Service
+
+The same Claude model powers all three modes. What differs is what Claude has access to and how much programmatic control you have over its behaviour.
+
+### claude.ai
+
+Claude in the browser. No local access. You can paste instructions and have a conversation, but Claude can only reason over what you give it in the chat. Cannot reach local databases, filesystems, or APIs.
+
+### Claude Desktop
+
+Same Claude model, same cloud inference, but with two local superpowers:
+
+**1. Local MCP servers** — Claude can call tools that run on your machine. In this project `get_user`, `flag_user`, etc. hit a local SQLite file that claude.ai could never reach. Claude Desktop spawns `mcp-server/server.py` as a subprocess and communicates over stdin/stdout.
+
+**2. Local skills/context** — Project instructions loaded from local SKILL.md files (or selected via the MCP prompt picker) tell Claude how to behave for your specific domain. The model inference still happens in Anthropic's cloud — what's local is the tooling and the instructions.
+
+Claude Desktop closes the gap between "a general Claude conversation" and "a Claude that knows your data and your domain rules" — without needing to build a full application.
+
+### Python Service (orchestrator + client)
+
+The full power layer. Adds programmatic control that Claude Desktop can't provide:
+
+- **Parallel agents** — `asyncio.gather` across 4 dimension agents simultaneously
+- **Extended thinking** — `budget_tokens` via direct Bedrock API
+- **Streaming** — SSE token-by-token delivery to the client
+- **Convergence/reflection** — second LLM judge calls between rounds
+- **Memory/persistence** — prior assessments stored and compared across runs
+- **HITL** — two-phase offboarding with client-owned confirmation gate
+
+### Capability comparison
+
+| Capability | claude.ai | Claude Desktop | Python Service |
+|---|---|---|---|
+| Chat with Claude | ✅ | ✅ | ✅ (via client CLI) |
+| Query local SQLite DB | ❌ | ✅ via MCP | ✅ via MCP |
+| Domain-specific skill rules | Manual paste | ✅ project instructions | ✅ loaded programmatically |
+| Single-agent risk assessment | ❌ | ✅ | ✅ |
+| Parallel agents + extended thinking | ❌ | ❌ | ✅ options 7–9 |
+| Convergence / reflection loops | ❌ | ❌ | ✅ options 5–6 |
+| Streaming SSE to client | ❌ | ❌ | ✅ |
+| Memory across sessions | ❌ | ❌ | ✅ option 9 |
+| HITL two-phase offboarding | ❌ | ✅ (in-chat CONFIRM) | ✅ (two HTTP calls) |
+
+Claude Desktop and the Python service are complementary — Desktop for interactive ad-hoc queries, the service for automated pipelines and richer flow patterns.
