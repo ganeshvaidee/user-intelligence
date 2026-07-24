@@ -8,3 +8,5 @@ env/
 .env
 
 .claude/settings.local.json
+
+seed/users.db
