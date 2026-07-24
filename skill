@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""
+Quick skill invoker — run skills directly from the command line.
+
+Usage:
+  skill lookup usr_001                          # Look up a user
+  skill risk usr_005                            # Risk assessment
+  skill offboard usr_005 "security concern"     # Offboard user
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "flows"))
+
+from run_flow import run_flow
+
+
+async def main():
+    print(f"[DEBUG] Script started with args: {sys.argv}", flush=True)
+
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    cmd = sys.argv[1].lower()
+    print(f"[DEBUG] Command: {cmd}", flush=True)
+
+    if cmd == "lookup":
+        if len(sys.argv) < 3:
+            print("Usage: skill lookup <user_id_or_email>")
+            sys.exit(1)
+        user_id = sys.argv[2]
+        request = f"Look up user {user_id}"
+        skills = ["_base", "lookup-user"]
+
+    elif cmd == "risk":
+        if len(sys.argv) < 3:
+            print("Usage: skill risk <user_id>")
+            sys.exit(1)
+        user_id = sys.argv[2]
+        request = f"Give me a risk assessment for {user_id}"
+        skills = ["_base", "lookup-user", "user-risk-profile"]
+
+    elif cmd == "offboard":
+        if len(sys.argv) < 4:
+            print("Usage: skill offboard <user_id> <reason>")
+            sys.exit(1)
+        user_id = sys.argv[2]
+        reason = " ".join(sys.argv[3:])
+        request = f"Offboard user {user_id}. Reason: {reason}"
+        skills = ["_base", "lookup-user", "user-risk-profile", "offboard-user"]
+
+    else:
+        print(f"Unknown command: {cmd}")
+        print(__doc__)
+        sys.exit(1)
+
+    print(f"\n📋 Request: {request}", flush=True)
+    print(f"🎯 Skills: {', '.join(skills)}\n", flush=True)
+    print("=" * 60, flush=True)
+
+    try:
+        print(f"[DEBUG] Calling run_flow...", flush=True)
+        result = await run_flow(
+            skill_names=skills,
+            user_request=request
+        )
+        print(f"[DEBUG] run_flow returned", flush=True)
+        print(result, flush=True)
+        print("=" * 60, flush=True)
+    except asyncio.TimeoutError:
+        print(f"❌ Timeout: The request took too long", flush=True)
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

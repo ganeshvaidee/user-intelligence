@@ -12,6 +12,7 @@
 #   3. Safety rules were followed (negative assertions)
 
 import asyncio
+import os
 import re
 import sys
 from pathlib import Path
@@ -20,13 +21,40 @@ from dataclasses import dataclass, field
 _FLOWS = str(Path(__file__).parent.parent / "flows")
 sys.path.insert(0, _FLOWS)
 
+# DEBUG: Verify environment setup
+print("\n[DEBUG] Environment Setup")
+print(f"  Python executable: {sys.executable}")
+print(f"  Python version: {sys.version}")
+print(f"  Flows path: {_FLOWS}")
+print(f"  Flows path exists: {Path(_FLOWS).exists()}")
+
 import sqlite3
 
-from run_flow import load_skill, _build_system_prompt, run_flow_parallel_risk, run_flow_parallel_risk_with_memory
-from tools import execute_tool, start_mcp_session, USER_TOOLS
-from bedrock_client import client, BEDROCK_MODEL_ID
+try:
+    from run_flow import load_skill, _build_system_prompt, run_flow_parallel_risk, run_flow_parallel_risk_with_memory
+    print("  ✓ Imported run_flow functions")
+except Exception as e:
+    print(f"  ✗ Failed to import run_flow: {e}")
+    sys.exit(1)
+
+try:
+    from tools import execute_tool, start_mcp_session, USER_TOOLS
+    print("  ✓ Imported tools module")
+except Exception as e:
+    print(f"  ✗ Failed to import tools: {e}")
+    sys.exit(1)
+
+try:
+    from llm_client import client, MODEL_ID
+    print(f"  ✓ Imported llm_client (MODEL_ID={MODEL_ID})")
+except Exception as e:
+    print(f"  ✗ Failed to import llm_client: {e}")
+    sys.exit(1)
 
 DB_PATH = Path(__file__).parent.parent / "seed" / "users.db"
+print(f"  Database path: {DB_PATH}")
+print(f"  Database exists: {DB_PATH.exists()}")
+print()
 
 
 # ── Test infrastructure ───────────────────────────────────────────
@@ -45,40 +73,71 @@ async def run_test_flow(user_request: str, skill_names: list[str]) -> tuple[str,
     Lightweight version of run_flow — no printing.
     Each call opens its own MCP server process.
     """
-    system_prompt = _build_system_prompt(load_skill(*skill_names))
+    print(f"\n    [DEBUG] Loading skills: {skill_names}")
+    try:
+        system_prompt = _build_system_prompt(load_skill(*skill_names))
+        print(f"    [DEBUG] System prompt built ({len(system_prompt)} chars)")
+    except Exception as e:
+        print(f"    [DEBUG] ERROR building system prompt: {e}")
+        raise
+
     messages      = [{"role": "user", "content": user_request}]
     response_text = ""
     tools_called  = []
+    loop_count    = 0
 
-    async with start_mcp_session() as session:
-        while True:
-            response = await client.messages.create(
-                model      = BEDROCK_MODEL_ID,
-                max_tokens = 2048,
-                system     = system_prompt,
-                tools      = USER_TOOLS,
-                messages   = messages,
-            )
+    try:
+        async with start_mcp_session() as session:
+            print(f"    [DEBUG] MCP session started")
+            while True:
+                loop_count += 1
+                print(f"    [DEBUG] Loop {loop_count}: calling Claude (model={MODEL_ID})")
+                try:
+                    response = await client.messages.create(
+                        model      = MODEL_ID,
+                        max_tokens = 2048,
+                        system     = system_prompt,
+                        tools      = USER_TOOLS,
+                        messages   = messages,
+                    )
+                except Exception as e:
+                    print(f"    [DEBUG] ERROR calling Claude: {type(e).__name__}: {e}")
+                    raise
 
-            tool_results = []
-            for block in response.content:
-                if block.type == "text":
-                    response_text += block.text
-                elif block.type == "tool_use":
-                    tools_called.append(block.name)
-                    result = await execute_tool(session, block.name, block.input)
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": block.id,
-                        "content":     result,
-                    })
+                print(f"    [DEBUG] Got response: {len(response.content)} content blocks, stop_reason={response.stop_reason}")
 
-            if response.stop_reason == "end_turn":
-                break
+                tool_results = []
+                for block in response.content:
+                    if block.type == "text":
+                        response_text += block.text
+                        print(f"    [DEBUG] Got text block ({len(block.text)} chars)")
+                    elif block.type == "tool_use":
+                        tools_called.append(block.name)
+                        print(f"    [DEBUG] Calling tool: {block.name}")
+                        try:
+                            result = await execute_tool(session, block.name, block.input)
+                            tool_results.append({
+                                "type":        "tool_result",
+                                "tool_use_id": block.id,
+                                "content":     result,
+                            })
+                            print(f"    [DEBUG] Tool {block.name} result: {result[:100]}...")
+                        except Exception as e:
+                            print(f"    [DEBUG] ERROR executing tool {block.name}: {type(e).__name__}: {e}")
+                            raise
 
-            messages.append({"role": "assistant", "content": response.content})
-            if tool_results:
-                messages.append({"role": "user", "content": tool_results})
+                if response.stop_reason == "end_turn":
+                    print(f"    [DEBUG] End turn reached, exiting loop")
+                    break
+
+                messages.append({"role": "assistant", "content": response.content})
+                if tool_results:
+                    messages.append({"role": "user", "content": tool_results})
+
+        print(f"    [DEBUG] Flow complete. Tools called: {tools_called}")
+    except Exception as e:
+        print(f"    [DEBUG] EXCEPTION in run_test_flow: {type(e).__name__}: {e}")
+        raise
 
     return response_text, tools_called
 
@@ -486,23 +545,35 @@ PARALLEL_AGENT_TESTS = [
 async def run_tests(tests: list) -> bool:
     print("\nUser Intelligence — Flow Tests")
     print("=" * 60)
+    print(f"[DEBUG] Running {len(tests)} tests")
+    print(f"[DEBUG] LLM Provider: {os.environ.get('LLM_PROVIDER', 'anthropic (default)')}")
+    print(f"[DEBUG] Model ID: {MODEL_ID}")
+    print()
 
     results = []
-    for test_fn in tests:
-        print(f"\n▶  {test_fn.__name__}...", end=" ", flush=True)
-        result = await test_fn()
-        results.append(result)
+    for i, test_fn in enumerate(tests, 1):
+        print(f"\n▶  [{i}/{len(tests)}] {test_fn.__name__}...", end=" ", flush=True)
+        try:
+            result = await test_fn()
+            results.append(result)
 
-        if result.error:
-            print(f"ERROR\n   💥 {result.error}")
-        elif result.passed:
-            print("PASS")
-            for d in result.details:
-                print(f"   {d}")
-        else:
-            print("FAIL")
-            for d in result.details:
-                print(f"   ❌ {d}")
+            if result.error:
+                print(f"ERROR\n   💥 {result.error}")
+                import traceback
+                traceback.print_exc()
+            elif result.passed:
+                print("PASS")
+                for d in result.details:
+                    print(f"   {d}")
+            else:
+                print("FAIL")
+                for d in result.details:
+                    print(f"   ❌ {d}")
+        except Exception as e:
+            print(f"EXCEPTION\n   💥 {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            results.append(TestResult(name=test_fn.__name__, passed=False, error=str(e)))
 
     passed = sum(1 for r in results if r.passed)
     total  = len(results)

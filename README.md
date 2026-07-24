@@ -20,12 +20,41 @@ Claude
 
 ---
 
+## Skills Overview
+
+The project includes **4 main skills** + **6 sub-skills** for advanced modes:
+
+**Main Skills:**
+- `_base` — error handling, safety rules
+- `lookup-user` — fetch user records
+- `user-risk-profile` — risk assessment (single-agent or parallel-agent mode)
+- `offboard-user` — offboarding flow (single-flow or two-phase mode)
+
+**Two Risk Assessment Modes:**
+1. **Single-agent** (faster) — Claude scores all 4 dimensions at once
+2. **Parallel-agent** (thorough) — 4 agents score one dimension each in parallel, with extended thinking and memory comparison
+
+**Two Offboarding Modes:**
+1. **Single-flow** (interactive CLI) — full flow with inline confirmation prompt
+2. **Two-phase** (APIs, web UIs) — separate assess/flag → human review → deactivate
+
+See [Skills Architecture](#skills-architecture) below for details.
+
+---
+
 ## Setup
 
 ### 1. Install dependencies
-
+#### For the project to be visible system-wide 
 ```bash
 pip install -r mcp-server/requirements.txt
+```
+OR
+#### To install in a local env 
+```bash
+  python -m venv path/to/venv
+  source path/to/venv/bin/activate
+  pip install -r mcp-server/requirements.txt
 ```
 
 ### 2. Seed the database
@@ -48,6 +77,8 @@ Authenticate with one of:
   ```bash
   export ANTHROPIC_API_KEY=sk-ant-...
   ```
+  To be safe, export the key in every window/console. (MCP server and client does not need it. But it does not hurt. Tests need it and Orchestrator too.)
+
 - **Your Claude account (OAuth)** — install the `ant` CLI, then:
   ```bash
   ant auth login
@@ -77,6 +108,8 @@ There are three ways to run this project.
 The simplest way. Starts the MCP server automatically as a subprocess and presents an interactive menu. No other services need to be running.
 
 ```bash
+python -m venv path/to/venv
+source path/to/venv/bin/activate
 cd flows
 python run_flow.py
 ```
@@ -138,6 +171,129 @@ Claude Desktop will call the MCP server tools automatically.
 
 ---
 
+## Skills Architecture
+
+### Main Skills (User-Facing)
+
+| Skill | Purpose | Dependencies |
+|-------|---------|--------------|
+| `_base` | Shared error handling, output format, safety rules | — |
+| `lookup-user` | Fetch and summarize user records by ID or email | `_base` |
+| `user-risk-profile` | Assess user risk on 0–15 point scale (single-agent mode) | `_base`, `lookup-user` |
+| `offboard-user` | Full offboarding flow: lookup → risk → flag → confirm → deactivate | `_base`, `lookup-user`, `user-risk-profile` |
+
+### Sub-Skills (Internal, Used by Parallel Agents)
+
+The framework supports **two modes** for risk assessment:
+
+#### Mode 1: Single-Agent Risk (Default)
+
+**Skills loaded:** `["_base", "lookup-user", "user-risk-profile"]`
+
+Claude scores all 4 dimensions in one pass within the `user-risk-profile` skill.
+
+**When to use:**
+- CLI options 1–6 (single-shot, convergence, critic-revise)
+- Interactive mode — fast response needed
+- Simple assessments without extended reasoning
+
+---
+
+#### Mode 2: Parallel-Agent Risk (Options 7–9)
+
+**Skills loaded:** `["_base"] + per-agent: [risk-auth, risk-permissions, risk-behaviour, risk-account]`
+
+Runs 4 independent agents in parallel. Each agent:
+1. Loads a focused sub-skill
+2. Fetches data independently
+3. Calls `report_dimension_score` to contribute its dimension score
+
+| Agent | Sub-Skill | Scores | Max Points |
+|-------|-----------|--------|-----------|
+| Agent 1 | `risk-auth` | Authentication (MFA, failed logins, IP diversity, dormancy) | 6 |
+| Agent 2 | `risk-permissions` | Permissions (admin access, sensitive resources, contractor status) | 5 |
+| Agent 3 | `risk-behaviour` | Behaviour (failure rate, sensitive access, off-hours activity) | 4 |
+| Agent 4 | `risk-account` | Account (flagged status, contractor, age) | 3 |
+
+**Extended thinking & memory (Options 8–9):**
+- Each agent can use extended thinking for deeper reasoning
+- System compares against prior assessments from DB (`get_prior_assessment`)
+- Outputs "Change Since Prior Assessment" section
+
+**When to use:**
+- CLI options 7, 8, 9 (parallel ± extended thinking ± memory)
+- When you want thorough, independent analysis of each dimension
+- When you want to track risk changes over time
+- When you want agent reasoning shown in output
+
+### Offboarding: Two Modes
+
+Similar to risk assessment, offboarding supports two modes:
+
+#### Mode 1: Single-Flow Offboarding (Interactive CLI)
+
+**Skills loaded:** `["_base", "lookup-user", "user-risk-profile", "offboard-user"]`
+
+**All 5 steps in one flow:**
+
+1. **Lookup** — fetch user details, activity, permissions
+2. **Risk Assessment** — score across 4 dimensions (0–15 scale)
+3. **Pre-deactivation Flag** — create audit trail
+4. **Confirmation Prompt** — present summary, **block until user types CONFIRM**
+5. **Deactivate** — execute if confirmed, output completion summary
+
+**When to use:**
+- CLI options 1–6, Mode 1 flow runner
+- Interactive mode — user is present and can type confirmation
+- Simple, immediate offboarding (all-in-one transaction)
+
+---
+
+#### Mode 2: Two-Phase Human-in-the-Loop (API/Web/Orchestrator)
+
+**Phase 1: Prepare (Assessment)**
+
+**Skills loaded:** `["_base", "lookup-user", "user-risk-profile", "offboard-prepare"]`
+
+**Steps:**
+1. **Lookup** — fetch user details, activity, permissions
+2. **Risk Assessment** — score across 4 dimensions (0–15 scale)
+3. **Pre-deactivation Flag** — create audit trail
+4. **Output Summary** — return structured report for human review
+5. **STOP** — do NOT ask for confirmation, do NOT deactivate
+
+**Output:** Risk assessment summary, permissions, last login, recommendation (human reviews this)
+
+---
+
+**Phase 2: Confirm (Execution)**
+
+**Skills loaded:** `["_base", "offboard-confirm"]`
+
+**Assumptions:**
+- Phase 1 was already completed
+- User lookup and risk assessment already done
+- Account already flagged
+- Human has already reviewed and approved deactivation
+
+**Step:**
+1. **Deactivate** — execute `deactivate_user(user_id, reason)` only
+2. **Output completion summary**
+
+**When to use:**
+- REST APIs, web dashboards, orchestrator service
+- Slack bots, email workflows
+- Any flow where assessment and approval are separated in time
+- Any flow where the confirmation decision happens outside of Claude's code
+
+**Why separate Phase 1 and Phase 2?**
+- **Safety**: Human reviews before anything destructive happens
+- **Audit trail**: Assessment is recorded before execution
+- **Flexibility**: Approval can happen hours/days later, in a different system
+- **Retry safety**: If Phase 2 fails, you can retry without re-assessing
+
+---
+
 ### Mode 3 — Separate services (MCP server + orchestrator + client)
 
 Run each component independently. This is useful for debugging, IDE integration, or deploying components separately.
@@ -157,18 +313,24 @@ MCP server starting on http://0.0.0.0:8001
 **Terminal 2 — Orchestrator:**
 
 ```bash
+python -m venv path/to/venv
+source path/to/venv/bin/activate
 MCP_URL=http://localhost:8001 python orchestrator/app.py --port 8000
 ```
 
 **Terminal 3 — Client:**
 
 ```bash
+python -m venv path/to/venv
+source path/to/venv/bin/activate
 python client/cli.py
 ```
 
 The client presents the same interactive menu as Mode 1. To point at a different orchestrator host:
 
 ```bash
+python -m venv path/to/venv
+source path/to/venv/bin/activate
 ORCHESTRATOR_URL=http://localhost:8000 python client/cli.py
 ```
 
@@ -224,8 +386,9 @@ python seed/seed.py
 ## Running tests
 
 ```bash
-cd flows
-python ../tests/test_flows.py
+python -m venv path/to/venv
+source path/to/venv/bin/activate
+python tests/test_flows.py
 ```
 
 Tests verify which tools were called, what the response contains, and that safety rules were followed (flag before deactivate, no writes without a reason).
