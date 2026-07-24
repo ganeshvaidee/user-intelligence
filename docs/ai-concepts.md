@@ -574,6 +574,33 @@ Claude Desktop closes the gap between "a general Claude conversation" and "a Cla
 
 ### Python Service (orchestrator + client)
 
+---
+
+## Client Options 1–9: Skills → Tools → Flow Pattern
+
+The client presents 9 options. Each option is NOT a unique skill combination — instead, options share skills but differ in **flow pattern** (how Claude processes the task). Here is the full chain:
+
+| Option | Task | Skills Used | Tools Claude Calls | Flow Pattern |
+|---|---|---|---|---|
+| 1 | Look up user | `_base`, `lookup-user` | `get_user`, `find_user_by_email`, `get_user_activity`, `get_user_permissions` | Single-shot agentic loop |
+| 2 | Risk assessment | `_base`, `lookup-user`, `user-risk-profile` | Same as 1 + `get_audit_log` | Single-shot agentic loop |
+| 3 | Full offboarding | `_base`, `lookup-user`, `user-risk-profile`, `offboard-user` | Same as 2 + `flag_user`, `deactivate_user` | Single-shot + Human-in-the-Loop |
+| 4 | Find by email + risk | `_base`, `lookup-user`, `user-risk-profile` | Same as 2 | Single-shot (different prompt, same skills/tools) |
+| 5 | Risk (convergence) | `_base`, `lookup-user`, `user-risk-profile` | Same as 2 | Convergence loop (judge after each round) |
+| 6 | Risk (critic-revise) | `_base`, `lookup-user`, `user-risk-profile` | Same as 2 | Critic-revise (critique then revise in same thread) |
+| 7 | Risk (parallel agents) | `risk-auth`, `risk-permissions`, `risk-behaviour`, `risk-account` | `get_user`, `get_user_activity`, `get_user_permissions`, `get_audit_log` (scoped per agent) | 4 concurrent dimension agents |
+| 8 | Risk + extended thinking | `risk-auth`, `risk-permissions`, `risk-behaviour`, `risk-account` | Same as 7 (scoped per agent) | 4 concurrent dimension agents + extended thinking |
+| 9 | Risk + thinking + memory | `risk-auth`, `risk-permissions`, `risk-behaviour`, `risk-account` | Same as 7 + `get_prior_assessment`, `save_assessment` (Python-driven) | 4 concurrent agents + extended thinking + memory persistence |
+
+### Key Insights
+
+- **Options 2, 4, 5, 6 share skills and tools** — the *flow pattern* is what differs. Option 2 is fastest (one pass); option 5 loops until complete; option 6 critiques then revises.
+- **Options 7, 8, 9 use different skills** — the dimension-specific skills (`risk-auth`, etc.) replace the monolithic `user-risk-profile` skill, enabling parallel agents with scoped tool access.
+- **Option 3 is unique** — it includes write tools (`flag_user`, `deactivate_user`) and adds a human-in-the-loop confirmation gate between phases.
+- **Memory is Python-driven** — option 9's `get_prior_assessment` and `save_assessment` are called by Python, not instructed by the skill. Claude never knows it's comparing to prior results.
+
+
+
 The full power layer. Adds programmatic control that Claude Desktop can't provide:
 
 - **Parallel agents** — `asyncio.gather` across 4 dimension agents simultaneously
