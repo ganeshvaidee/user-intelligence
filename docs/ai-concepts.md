@@ -3,8 +3,6 @@
 ## TODOs — Concepts to Explore Next (Evals)
 
 - [ ]  **LLM-as-Judge for response quality** — instead of keyword matching (`"MFA" in response`), use a second Claude call to evaluate whether the response is accurate, well-justified, and actionable. More robust than string checks against non-deterministic output.
-- [x]  **Score accuracy evals** — `extract_risk_score` + `assert_score_in_range` added to `tests/test_flows.py`. Handles multiple formatting variants. Single-agent tests use dual-path fallback (score or keyword); parallel agent tests enforce score strictly.
-- [x]  **Regression suite on skill changes** — implemented via Claude Code hooks. See Hooks in Done section and `docs/improvements/hooks.md`.
 - [ ]  **Golden dataset** — a fixed set of (request, expected_tools_called, expected_score_range, expected_keywords) tuples that cover all users and all flow types. Currently tests are hand-written per scenario; a dataset makes coverage gaps visible.
 - [ ]  **Consistency evals** — run the same request N times and check that scores and tool call sequences are stable. LLM outputs are non-deterministic; high variance on the same input is a signal the skill instructions are ambiguous.
 
@@ -19,6 +17,8 @@
 - [X]  **Memory / Persistence** — see concept 12 below and `docs/improvements/memory-persistence.md`. **Only used in option 9 (parallel + extended thinking + memory).**
 - [x]  **Hooks** — see `docs/improvements/hooks.md`. PostToolUse hook runs the eval suite automatically after any SKILL.md edit.
 - [x]  **Human-in-the-Loop** — see concept 13 below and `docs/improvements/human-in-the-loop.md`. Two-phase offboarding with client-owned confirmation gate.
+- [x]  **Score accuracy evals** — `extract_risk_score` + `assert_score_in_range` in `tests/test_flows.py`. Handles multiple formatting variants (structured template, informal prose, etc.). Single-agent tests use dual-path fallback (score or keyword); parallel agent tests enforce numeric score strictly.
+- [x]  **Regression suite on skill changes** — implemented via Claude Code hooks (`FileChanged` event). Hook runs `tests/test_flows.py --mode single` automatically whenever a SKILL.md file is saved, catching regressions before they ship. See `docs/improvements/hooks.md`.
 
 ---
 
