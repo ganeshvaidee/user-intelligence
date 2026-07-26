@@ -42,6 +42,28 @@ See [Skills Architecture](#skills-architecture) below for details.
 
 ---
 
+## Documentation
+
+For detailed explanations of the AI/Claude concepts implemented in this project, see **[docs/ai-concepts.md](docs/ai-concepts.md)**. It covers:
+
+- **Evals** — end-to-end testing methodology
+- **Tool Use** — function calling and MCP
+- **Agentic Loops** — how Claude iterates until it decides it's done
+- **Skills** — system prompt engineering and composability
+- **MCP (Model Context Protocol)** — tool schema definition and dispatch
+- **LLM-as-Judge** — structured output via `tool_choice`
+- **Multi-turn Conversations** — stateful context across rounds
+- **Prompt Caching** — token-efficient API calls
+- **Streaming** — real-time token delivery
+- **Parallel Agents** — concurrent dimension scoring
+- **Extended Thinking** — step-by-step reasoning
+- **Memory & Persistence** — cross-session risk comparisons
+- **Human-in-the-Loop** — two-phase offboarding with confirmation gates
+- **Orchestration Patterns** — single-shot, convergence loop, critic-revise, parallel risk
+- **Client Options 1–9** — mapping from user choice → skills → tools → flow pattern
+
+---
+
 ## Setup
 
 ### 1. Install dependencies
