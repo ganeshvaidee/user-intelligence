@@ -52,7 +52,38 @@ async def start_mcp_session():
                 yield session
 
 
-# ── User intelligence tool schemas ────────────────────────────────
+# ── Per-skill tool visibility ────────────────────────────────────
+
+SKILL_TOOLS: dict[str, set[str]] = {
+    "_base":              set(),
+    "lookup-user":        {"get_user", "find_user_by_email", "get_user_activity", "get_user_permissions"},
+    "user-risk-profile":  {"get_user_activity", "get_audit_log"},
+    "offboard-user":      {"flag_user", "deactivate_user"},
+    "offboard-prepare":   {"flag_user"},
+    "offboard-confirm":   {"deactivate_user"},
+    "risk-auth":          {"get_user", "get_user_activity"},
+    "risk-permissions":   {"get_user", "get_user_permissions"},
+    "risk-behaviour":     {"get_user_activity"},
+    "risk-account":       {"get_user", "get_audit_log"},
+}
+
+
+def tools_for_skills(skill_names: list[str]) -> list[dict]:
+    """Union the tool sets of every loaded skill, filtered against USER_TOOLS.
+    Unknown skill names contribute nothing extra (fail open to empty set)."""
+    allowed = set()
+    for name in skill_names:
+        allowed |= SKILL_TOOLS.get(name, set())
+    return [t for t in USER_TOOLS if t["name"] in allowed]
+
+
+ORDER_REQUIREMENTS: dict[str, list[str]] = {
+    "flag_user":       ["get_user_activity"],
+    "deactivate_user": ["flag_user"],
+}
+
+
+# ── User intelligence tool schemas ────────────────────────────────────
 
 USER_TOOLS = [
     {

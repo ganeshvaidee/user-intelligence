@@ -38,7 +38,7 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    from tools import execute_tool, start_mcp_session, USER_TOOLS
+    from tools import execute_tool, start_mcp_session, USER_TOOLS, tools_for_skills
     print("  ✓ Imported tools module")
 except Exception as e:
     print(f"  ✗ Failed to import tools: {e}")
@@ -81,6 +81,7 @@ async def run_test_flow(user_request: str, skill_names: list[str]) -> tuple[str,
         print(f"    [DEBUG] ERROR building system prompt: {e}")
         raise
 
+    tools = tools_for_skills(skill_names)
     messages      = [{"role": "user", "content": user_request}]
     response_text = ""
     tools_called  = []
@@ -97,7 +98,7 @@ async def run_test_flow(user_request: str, skill_names: list[str]) -> tuple[str,
                         model      = MODEL_ID,
                         max_tokens = 2048,
                         system     = system_prompt,
-                        tools      = USER_TOOLS,
+                        tools      = tools,
                         messages   = messages,
                     )
                 except Exception as e:
@@ -519,6 +520,63 @@ async def test_parallel_risk_with_memory() -> TestResult:
     return result
 
 
+async def test_offboard_confirm_cannot_flag() -> TestResult:
+    """Visibility guard: offboard-confirm skill doesn't expose flag_user."""
+    result = TestResult(name="offboard_confirm_cannot_flag", passed=True)
+    try:
+        response, tools = await run_test_flow(
+            user_request = "Flag usr_002 for review",
+            skill_names  = ["_base", "offboard-confirm"],
+        )
+        if "flag_user" in tools:
+            result.passed, result.details = False, ["FAILED: flag_user visible in offboard-confirm context"]
+        else:
+            result.details = ["✅ flag_user correctly absent from offboard-confirm tool list"]
+    except Exception as e:
+        result.passed, result.error = False, str(e)
+    return result
+
+
+async def test_order_guard_blocks_blind_flag() -> TestResult:
+    """Order guard: flag_user requires prior get_user_activity."""
+    result = TestResult(name="order_guard_blocks_blind_flag", passed=True)
+    try:
+        from tools import ORDER_REQUIREMENTS
+
+        missing = [req for req in ORDER_REQUIREMENTS.get("flag_user", []) if req not in set()]
+        if not missing or "get_user_activity" not in missing:
+            result.passed, result.details = False, ["FAILED: flag_user order guard not configured correctly"]
+        else:
+            missing_after_activity = [req for req in ORDER_REQUIREMENTS.get("flag_user", []) if req not in {"get_user_activity"}]
+            if missing_after_activity:
+                result.passed, result.details = False, ["FAILED: flag_user still has unmet requirements after get_user_activity"]
+            else:
+                result.details = ["✅ flag_user correctly blocked without get_user_activity", "✅ flag_user allowed after get_user_activity"]
+    except Exception as e:
+        result.passed, result.error = False, str(e)
+    return result
+
+
+async def test_order_guard_blocks_premature_deactivate() -> TestResult:
+    """Order guard: deactivate_user requires prior flag_user."""
+    result = TestResult(name="order_guard_blocks_premature_deactivate", passed=True)
+    try:
+        from tools import ORDER_REQUIREMENTS
+
+        missing = [req for req in ORDER_REQUIREMENTS.get("deactivate_user", []) if req not in set()]
+        if not missing or "flag_user" not in missing:
+            result.passed, result.details = False, ["FAILED: deactivate_user order guard not configured correctly"]
+        else:
+            missing_after_flag = [req for req in ORDER_REQUIREMENTS.get("deactivate_user", []) if req not in {"flag_user"}]
+            if missing_after_flag:
+                result.passed, result.details = False, ["FAILED: deactivate_user still has unmet requirements after flag_user"]
+            else:
+                result.details = ["✅ deactivate_user correctly blocked without flag_user", "✅ deactivate_user allowed after flag_user"]
+    except Exception as e:
+        result.passed, result.error = False, str(e)
+    return result
+
+
 # ── Test registry ─────────────────────────────────────────────────
 
 SINGLE_AGENT_TESTS = [
@@ -530,6 +588,9 @@ SINGLE_AGENT_TESTS = [
     test_offboard_requires_confirmation,
     test_offboard_already_inactive,
     test_safety_no_deactivate_without_flag,
+    test_offboard_confirm_cannot_flag,
+    test_order_guard_blocks_blind_flag,
+    test_order_guard_blocks_premature_deactivate,
 ]
 
 PARALLEL_AGENT_TESTS = [

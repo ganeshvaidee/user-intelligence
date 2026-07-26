@@ -273,6 +273,45 @@ There are no automatic retries in the tool loop or in the flow functions. The de
 
 ---
 
+## Security Guardrails
+
+This codebase enforces **hard access boundaries** using two mechanisms:
+
+### Per-Flow Tool Visibility
+
+Each flow (a combination of loaded skills) restricts Claude to only the tools that those skills declare they need. This follows the principle of **minimal permissions**: Claude never sees a tool it shouldn't call.
+
+**Implementation:** `tools_for_skills()` in `flows/tools.py` unions the tool sets from all loaded skills and filters `USER_TOOLS` to only those names.
+
+**Example:** The offboard workflow has two phases:
+- **offboard-prepare phase** loads `["_base", "lookup-user", "user-risk-profile", "offboard-prepare"]`
+  - Visible tools: get_user, find_user_by_email, get_user_activity, get_user_permissions, get_audit_log, flag_user
+  - NOT visible: `deactivate_user` (prevents premature account deactivation)
+- **offboard-confirm phase** loads `["_base", "offboard-confirm"]`
+  - Visible tools: `deactivate_user` only
+  - NOT visible: lookup, risk, or flag tools (prevents re-running checks or re-flagging)
+
+This is more than prose instruction — the tools Claude cannot see are literally not in the tool list it receives, making violations impossible instead of just discouraged.
+
+### Order Guard
+
+Some tools have dependencies: they should only be called after other tools have succeeded. The order guard enforces these at dispatch time (in `_run_tool_loop` before `execute_tool()`).
+
+**Current requirements** (defined in `ORDER_REQUIREMENTS` in `flows/tools.py`):
+- `flag_user` requires `get_user_activity` — prevents flagging without looking at activity data
+- `deactivate_user` requires `flag_user` — prevents deactivating an account without flagging it first
+
+**How it works:** If Claude attempts to call a tool before its dependencies are met:
+1. The order guard detects this in `_run_tool_loop`
+2. Instead of calling the MCP server, it returns an error dict: `{"error": "Cannot call deactivate_user before flag_user has succeeded..."}`
+3. Claude receives this error as a tool result
+4. The `_base` skill's error-handling rules instruct Claude to surface the error and retry in the right order
+5. Claude naturally recovers and calls the dependencies first
+
+This means the LLM can still reason about what went wrong and fix its behavior, but it cannot bypass the dependency at the dispatch layer.
+
+---
+
 ## MCP server: tool setup and discoverability
 
 ### How tools are defined
@@ -416,14 +455,167 @@ Re-seed after any offboard test: `python seed/seed.py`
 
 ## Adding a new skill
 
-1. Create `skills/<name>/SKILL.md` with YAML frontmatter (`name`, `description`, `dependencies`)
-2. Write the skill body: steps, rules, output format
-3. Pass it in `skill_names` when calling a flow function, after its dependencies
+**Step 1: Create the skill file**
+1. Create `skills/<name>/SKILL.md` with YAML frontmatter:
+   ```markdown
+   ---
+   name: my-skill
+   description: >
+     Short description of what this skill does...
+   ---
+   
+   # My Skill
+   
+   ## Steps
+   1. Call tool X
+   2. ...
+   ```
+2. Write the skill body: steps, rules, output format, error handling
+
+**Step 2: Declare tool visibility**
+
+Add an entry to `SKILL_TOOLS` in `flows/tools.py`:
+```python
+SKILL_TOOLS: dict[str, set[str]] = {
+    ...
+    "my-skill": {"tool1", "tool2", ...},
+}
+```
+
+List exactly which tools this skill calls. When skills are loaded together (e.g., `["_base", "lookup-user", "my-skill"]`), their tool sets are unioned and Claude only sees that union.
+
+**Example:** offboard-prepare calls lookup, risk assessment, and flagging:
+```python
+"offboard-prepare": {"flag_user"},  # rest inherited from dependency skills
+```
+Even though lookup-user and user-risk-profile are also loaded, their tools are added via the SKILL_TOOLS union. offboard-prepare itself only adds `flag_user`; it cannot add `deactivate_user` (that tool is restricted to offboard-confirm).
+
+**Step 3: Watch for tool ordering constraints**
+
+If your skill calls a tool that has `ORDER_REQUIREMENTS`, ensure your steps follow that order. For example:
+- If calling `flag_user`, you must call `get_user_activity` first (or Claude will receive an order-guard error)
+- If calling `deactivate_user`, you must call `flag_user` first
+
+The `_base` skill's error-handling rules will instruct Claude to retry in the right sequence if it attempts the wrong order.
+
+**Step 4: Load and test**
+
+Pass the skill name when calling a flow function:
+```python
+response = await run_flow(
+    user_request = "...",
+    skill_names  = ["_base", "lookup-user", "my-skill"],
+)
+```
+
+Skills are loaded in dependency order (always `_base` first if needed). The tool visibility and order guards are applied automatically.
 
 ## Adding a new tool
 
-1. Add the database function to `mcp-server/database.py`
-2. Add the `@mcp.tool()` to `mcp-server/server.py`
-3. Add the matching JSON schema to `USER_TOOLS` in `flows/tools.py`
-4. Add the dispatch case to `execute_tool()` in `flows/tools.py` if needed (FastMCP routing is automatic via `session.call_tool`)
-5. Update the relevant `SKILL.md` files to instruct Claude when to call the new tool
+A tool exists in three places and must be kept in sync:
+
+### 1. Database layer: `mcp-server/database.py`
+
+Add the implementation (if it needs a database):
+```python
+def my_tool(user_id: str, reason: str) -> dict:
+    # Fetch, validate, and mutate as needed
+    return {"status": "success", ...}
+```
+
+### 2. MCP server: `mcp-server/server.py`
+
+Register the tool with FastMCP:
+```python
+@mcp.tool()
+def my_tool(user_id: str, reason: str) -> dict:
+    """
+    What this tool does and when to use it.
+    Returns a dict with results or {"error": "..."}
+    """
+    return database.my_tool(user_id, reason)
+```
+
+FastMCP auto-generates the JSON schema from the function signature and docstring.
+
+### 3. Bedrock layer: `flows/tools.py`
+
+Add the JSON schema to `USER_TOOLS` (so Claude knows about the tool):
+```python
+USER_TOOLS = [
+    ...
+    {
+        "name": "my_tool",
+        "description": (
+            "Detailed description of what this tool does, when to call it, "
+            "and what output to expect. This is Claude's primary signal."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string", "description": "..."},
+                "reason":  {"type": "string", "description": "..."},
+            },
+            "required": ["user_id", "reason"],
+        },
+    },
+]
+```
+
+The description in `USER_TOOLS` can be more detailed than the server.py docstring, since it's Claude's primary guide for when and how to call the tool.
+
+### 4. Tool visibility: `flows/tools.py` — update `SKILL_TOOLS`
+
+Decide which skills should call this tool, and add it to their sets:
+```python
+SKILL_TOOLS: dict[str, set[str]] = {
+    ...
+    "skill-that-uses-my-tool": {"my_tool", ...},
+}
+```
+
+Only skills that declare this tool in `SKILL_TOOLS` will expose it to Claude. Other flows will not see it.
+
+### 5. Tool ordering (if needed): `flows/tools.py` — update `ORDER_REQUIREMENTS`
+
+If a tool should only be called after other tools have succeeded, add an entry to enforce this as a hard constraint (not just prose instruction):
+
+```python
+ORDER_REQUIREMENTS: dict[str, list[str]] = {
+    "flag_user":       ["get_user_activity"],
+    "deactivate_user": ["flag_user"],
+}
+```
+
+The order guard in `_run_tool_loop` enforces these dependencies at dispatch time: if Claude attempts to call a tool before its prerequisites succeed, it receives an error dict instead of MCP dispatch.
+
+**Real example from this codebase:**
+
+The user deactivation flow has two critical dependencies:
+
+1. **`flag_user` requires `get_user_activity`**
+   - Security rationale: Never flag a user without examining recent activity
+   - If Claude calls `flag_user` directly without checking activity, it receives:
+     ```json
+     {"error": "Cannot call flag_user before get_user_activity has succeeded in this conversation."}
+     ```
+   - Claude reads this error, calls `get_user_activity` first, then retries `flag_user`
+
+2. **`deactivate_user` requires `flag_user`**
+   - Security rationale: Account must be flagged (audit trail) before permanent deactivation
+   - If Claude attempts to deactivate without flagging first, it receives:
+     ```json
+     {"error": "Cannot call deactivate_user before flag_user has succeeded in this conversation."}
+     ```
+   - Claude recovers by calling `flag_user` first (which itself requires activity lookup)
+
+This creates a **chain of enforcement**: to deactivate, you must flag; to flag, you must look at activity. The order guard makes violations impossible, not just discouraged by prose.
+
+### 6. Skills: Update `SKILL.md` files
+
+Add or update skill files to instruct Claude when to call your tool:
+- When should this tool be called?
+- What preconditions must be met?
+- What should Claude do with the result?
+
+The skill prose and the code-level guardrails (visibility + order guard) work together: prose explains the intent, guardrails enforce the boundaries.

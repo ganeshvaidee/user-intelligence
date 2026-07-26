@@ -21,6 +21,8 @@ from tools import (
     start_mcp_session,
     _check_completeness,
     _critique_response,
+    tools_for_skills,
+    ORDER_REQUIREMENTS,
 )
 
 SKILLS_DIR = Path(__file__).parent.parent / "skills"
@@ -67,6 +69,8 @@ async def _run_tool_loop(
     session,
     verbose: bool = False,
     seen_calls: dict | None = None,
+    tools: list[dict] | None = None,
+    completed: set[str] | None = None,
 ) -> tuple[list[dict], str]:
     """
     Run the agentic tool-use loop until stop_reason == 'end_turn'.
@@ -78,8 +82,11 @@ async def _run_tool_loop(
     accumulated_text = ""
     if seen_calls is None:
         seen_calls = {}
+    if completed is None:
+        completed = set()
+    active_tools = tools if tools is not None else USER_TOOLS
 
-    cached_tools = [*USER_TOOLS[:-1], {**USER_TOOLS[-1], "cache_control": {"type": "ephemeral"}}]
+    cached_tools = [*active_tools[:-1], {**active_tools[-1], "cache_control": {"type": "ephemeral"}}] if active_tools else []
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 
     while True:
@@ -118,7 +125,15 @@ async def _run_tool_loop(
                     seen_calls[cache_key] = True
                 if verbose:
                     print(f"\n[TOOL CALL] {block.name}({json.dumps(block.input, indent=2)})")  # tool calls always printed
-                result = await execute_tool(session, block.name, block.input)
+                missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
+                if missing:
+                    result = json.dumps({
+                        "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
+                    })
+                else:
+                    result = await execute_tool(session, block.name, block.input)
+                    if "error" not in json.loads(result):
+                        completed.add(block.name)
                 if verbose:
                     display = result[:300] + "..." if len(result) > 300 else result
                     print(f"[TOOL RESULT] {display}\n")
@@ -144,6 +159,7 @@ async def _run_tool_loop(
 async def run_flow(user_request: str, skill_names: list[str], verbose: bool = True) -> str:
     """Single-shot: Claude calls tools until it decides it's done."""
     system_prompt = _build_system_prompt(load_skill(*skill_names))
+    tools = tools_for_skills(skill_names)
 
     if verbose:
         _print_header(user_request, skill_names)
@@ -154,6 +170,7 @@ async def run_flow(user_request: str, skill_names: list[str], verbose: bool = Tr
             [{"role": "user", "content": user_request}],
             session,
             verbose,
+            tools=tools,
         )
     return response_text
 
@@ -170,9 +187,11 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
     """
     system_prompt  = _build_system_prompt(load_skill(*skill_names))
     messages       = [{"role": "user", "content": user_request}]
-    cached_tools   = [*USER_TOOLS[:-1], {**USER_TOOLS[-1], "cache_control": {"type": "ephemeral"}}]
+    tools = tools_for_skills(skill_names)
+    cached_tools   = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}] if tools else []
     cached_system  = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
+    completed: set[str] = set()
 
     while True:
         tool_results: list[dict] = []
@@ -198,7 +217,15 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
                     cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
                     if cache_key not in seen_calls:
                         seen_calls[cache_key] = True
-                    result = await execute_tool(session, block.name, block.input)
+                    missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
+                    if missing:
+                        result = json.dumps({
+                            "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
+                        })
+                    else:
+                        result = await execute_tool(session, block.name, block.input)
+                        if "error" not in json.loads(result):
+                            completed.add(block.name)
                     tool_results.append({
                         "type":        "tool_result",
                         "tool_use_id": block.id,
@@ -227,9 +254,11 @@ async def run_flow_until_complete_stream(
     """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
     messages      = [{"role": "user", "content": user_request}]
-    cached_tools  = [*USER_TOOLS[:-1], {**USER_TOOLS[-1], "cache_control": {"type": "ephemeral"}}]
+    tools = tools_for_skills(skill_names)
+    cached_tools  = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}] if tools else []
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
+    completed: set[str] = set()
 
     for round_num in range(1, max_rounds + 1):
         round_text = ""
@@ -258,7 +287,15 @@ async def run_flow_until_complete_stream(
                         cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
                         if cache_key not in seen_calls:
                             seen_calls[cache_key] = True
-                        result = await execute_tool(session, block.name, block.input)
+                        missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
+                        if missing:
+                            result = json.dumps({
+                                "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
+                            })
+                        else:
+                            result = await execute_tool(session, block.name, block.input)
+                            if "error" not in json.loads(result):
+                                completed.add(block.name)
                         tool_results.append({
                             "type":        "tool_result",
                             "tool_use_id": block.id,
@@ -301,9 +338,11 @@ async def run_flow_with_reflection_stream(
     The critic call runs silently — only Claude's text is streamed.
     """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
-    cached_tools  = [*USER_TOOLS[:-1], {**USER_TOOLS[-1], "cache_control": {"type": "ephemeral"}}]
+    tools = tools_for_skills(skill_names)
+    cached_tools  = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}] if tools else []
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
+    completed: set[str] = set()
 
     # ── Phase 1 — initial response ────────────────────────────────
     messages     = [{"role": "user", "content": user_request}]
@@ -326,7 +365,15 @@ async def run_flow_with_reflection_stream(
                     cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
                     if cache_key not in seen_calls:
                         seen_calls[cache_key] = True
-                    result = await execute_tool(session, block.name, block.input)
+                    missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
+                    if missing:
+                        result = json.dumps({
+                            "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
+                        })
+                    else:
+                        result = await execute_tool(session, block.name, block.input)
+                        if "error" not in json.loads(result):
+                            completed.add(block.name)
                     tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
             messages.append({"role": "assistant", "content": response.content})
@@ -366,7 +413,15 @@ async def run_flow_with_reflection_stream(
                     cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
                     if cache_key not in seen_calls:
                         seen_calls[cache_key] = True
-                    result = await execute_tool(session, block.name, block.input)
+                    missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
+                    if missing:
+                        result = json.dumps({
+                            "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
+                        })
+                    else:
+                        result = await execute_tool(session, block.name, block.input)
+                        if "error" not in json.loads(result):
+                            completed.add(block.name)
                     tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
             messages.append({"role": "assistant", "content": response.content})
@@ -390,6 +445,7 @@ async def run_flow_until_complete(
     out during the completeness check between rounds.
     """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
+    tools = tools_for_skills(skill_names)
 
     if verbose:
         _print_header(user_request, skill_names)
@@ -397,13 +453,14 @@ async def run_flow_until_complete(
     messages   = [{"role": "user", "content": user_request}]
     all_text   = ""
     seen_calls = {}
+    completed: set[str] = set()
 
     for round_num in range(1, max_rounds + 1):
         if verbose and round_num > 1:
             print(f"\n[CONVERGENCE] ── Round {round_num} ─────────────────────")
 
         async with start_mcp_session() as session:
-            messages, round_text = await _run_tool_loop(system_prompt, messages, session, verbose, seen_calls)
+            messages, round_text = await _run_tool_loop(system_prompt, messages, session, verbose, seen_calls, tools=tools, completed=completed)
         all_text += round_text
 
         if round_num == max_rounds:
@@ -444,12 +501,14 @@ async def run_flow_with_reflection(
     One MCP server process spans both the initial pass and the revision.
     """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
+    tools = tools_for_skills(skill_names)
 
     if verbose:
         _print_header(user_request, skill_names)
         print("[REFLECTION] Phase 1: Initial assessment...")
 
     seen_calls = {}
+    completed: set[str] = set()
 
     async with start_mcp_session() as session:
         # Phase 1 — initial response
@@ -459,6 +518,8 @@ async def run_flow_with_reflection(
             session,
             verbose,
             seen_calls,
+            tools=tools,
+            completed=completed,
         )
 
         # Phase 2 — critique (pure LLM call, no MCP needed)
@@ -489,7 +550,7 @@ async def run_flow_with_reflection(
             ),
         })
 
-        _, revised_text = await _run_tool_loop(system_prompt, messages, session, verbose, seen_calls)
+        _, revised_text = await _run_tool_loop(system_prompt, messages, session, verbose, seen_calls, tools=tools, completed=completed)
 
     return revised_text
 
