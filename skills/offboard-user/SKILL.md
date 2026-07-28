@@ -9,16 +9,9 @@ description: >
 
 # Offboard User Skill
 
-## Dependencies
-Read first, in order:
-1. `skills/_base/SKILL.md`
-2. `skills/lookup-user/SKILL.md`
-3. `skills/user-risk-profile/SKILL.md`
+## Mandatory 5-Step Flow
 
-This skill composes those two skills into a safe, auditable
-offboarding flow. It never skips steps, even if the caller asks.
-
-## The Mandatory 5-Step Flow
+Never skip steps, even if the caller asks.
 
 ### Step 1 — Lookup
 Run the full lookup-user flow for the given user.
@@ -87,11 +80,6 @@ Account has been deactivated.
 Recommend: revoke any API keys, rotate shared secrets, 
 and notify [department] manager.
 ```
-
-## What This Skill Does NOT Do
-- Does not revoke API keys (out of scope for this MCP server)
-- Does not notify the user via email
-- Does not remove permissions individually — full deactivation only
 
 ## Error Recovery
 If Step 5 fails after Step 3 (flag succeeded but deactivate failed):

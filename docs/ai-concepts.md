@@ -216,13 +216,13 @@ Prompt caching marks static content with `cache_control: {type: ephemeral}` so B
 system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 ```
 
-**Tools list** — `USER_TOOLS` never changes within a flow. The cache breakpoint is added to the last tool entry at the point of the API call, not in the list definition:
+**Tools list** — `USER_TOOLS` never changes within a flow. The cache breakpoint is added to all tool entries:
 
 ```python
-cached_tools = [*USER_TOOLS[:-1], {**USER_TOOLS[-1], "cache_control": {"type": "ephemeral"}}]
+cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in USER_TOOLS]
 ```
 
-The API caches everything up to and including the tool with the breakpoint.
+The API caches all tools up to and including the last entry.
 
 **Judge system prompts** — `_check_completeness` and `_critique_response` also cache their static system strings. Low individual gain but correct practice — the system prompt is cached after the first judge call and served from cache in any subsequent rounds.
 

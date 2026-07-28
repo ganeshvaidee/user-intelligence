@@ -86,7 +86,7 @@ async def _run_tool_loop(
         completed = set()
     active_tools = tools if tools is not None else USER_TOOLS
 
-    cached_tools = [*active_tools[:-1], {**active_tools[-1], "cache_control": {"type": "ephemeral"}}] if active_tools else []
+    cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in active_tools] if active_tools else []
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 
     while True:
@@ -188,7 +188,7 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
     system_prompt  = _build_system_prompt(load_skill(*skill_names))
     messages       = [{"role": "user", "content": user_request}]
     tools = tools_for_skills(skill_names)
-    cached_tools   = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}] if tools else []
+    cached_tools   = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in tools] if tools else []
     cached_system  = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
     completed: set[str] = set()
@@ -255,7 +255,7 @@ async def run_flow_until_complete_stream(
     system_prompt = _build_system_prompt(load_skill(*skill_names))
     messages      = [{"role": "user", "content": user_request}]
     tools = tools_for_skills(skill_names)
-    cached_tools  = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}] if tools else []
+    cached_tools  = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in tools] if tools else []
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
     completed: set[str] = set()
@@ -339,7 +339,7 @@ async def run_flow_with_reflection_stream(
     """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
     tools = tools_for_skills(skill_names)
-    cached_tools  = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}] if tools else []
+    cached_tools  = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in tools] if tools else []
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
     completed: set[str] = set()
@@ -604,7 +604,7 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
     messages      = [{"role": "user", "content": f"Score the {dimension} risk dimension for user {user_id}."}]
     base_tools    = _DIMENSION_TOOLS[dimension]
     all_tools     = base_tools + [_DIMENSION_SCORE_TOOL]
-    cached_tools  = [*all_tools[:-1], {**all_tools[-1], "cache_control": {"type": "ephemeral"}}]
+    cached_tools  = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in all_tools]
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     score_result  = None
     tools_called: list[str] = []

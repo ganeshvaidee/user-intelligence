@@ -30,10 +30,10 @@ system = [
 ]
 ```
 
-For tools, add `cache_control` to the last tool in the list. The API caches everything up to and including that entry:
+For tools, add `cache_control` to all tools in the list. The API caches everything up to and including the last entry:
 
 ```python
-cached_tools = [*USER_TOOLS[:-1], {**USER_TOOLS[-1], "cache_control": {"type": "ephemeral"}}]
+cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in USER_TOOLS]
 ```
 
 `cache_control: {type: ephemeral}` means the cache lives for 5 minutes — long enough to cover all rounds in a single flow, automatically expiring after.
@@ -55,7 +55,7 @@ response = await client.messages.create(
 )
 
 # After
-cached_tools = [*USER_TOOLS[:-1], {**USER_TOOLS[-1], "cache_control": {"type": "ephemeral"}}]
+cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in USER_TOOLS]
 response = await client.messages.create(
     model      = BEDROCK_MODEL_ID,
     max_tokens = 4096,

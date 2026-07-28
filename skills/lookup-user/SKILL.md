@@ -8,9 +8,6 @@ description: >
 
 # Lookup User Skill
 
-## Dependencies
-Read first: `skills/_base/SKILL.md`
-
 ## Steps
 
 1. **Resolve the identifier**
@@ -44,9 +41,8 @@ Read first: `skills/_base/SKILL.md`
 ```
 
 ## Flags to Surface
-Automatically note if any of these are true:
 - `mfa_enabled = false` → ⚠️ No MFA
-- `employee_type` is contractor or vendor → ⚠️ Non-employee account  
-- `last_login` > 90 days ago → ⚠️ Dormant account
-- `status = flagged` → ⚠️ Account under review
-- `high_risk_count > 0` → ⚠️ Has elevated permissions
+- `employee_type` is contractor/vendor → ⚠️ Non-employee
+- `last_login` > 90 days → ⚠️ Dormant
+- `status = flagged` → ⚠️ Under review
+- `high_risk_count > 0` → ⚠️ Elevated permissions

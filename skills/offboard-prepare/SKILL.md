@@ -13,11 +13,7 @@ dependencies:
 
 # Offboard Prepare Skill (Phase 1 of 2)
 
-## Purpose
-
-This is Phase 1 of a two-phase Human-in-the-Loop offboarding flow.
-Your job is to assess the user and flag the account — then stop.
-The client will present your output to a human and ask for confirmation.
+Assess the user and flag the account — then stop.
 Deactivation happens in Phase 2 (`offboard-confirm`) only if the human approves.
 
 ## Steps
@@ -71,8 +67,3 @@ Do NOT proceed to deactivation under any circumstances.
 
 The client owns the confirmation gate. Your output will be reviewed by a human
 who will decide whether to proceed with Phase 2.
-
-## What This Skill Does NOT Do
-- Does not deactivate the account (that is Phase 2)
-- Does not ask for confirmation (that is the client's job)
-- Does not revoke API keys or send notifications

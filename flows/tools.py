@@ -88,11 +88,7 @@ ORDER_REQUIREMENTS: dict[str, list[str]] = {
 USER_TOOLS = [
     {
         "name": "get_user",
-        "description": (
-            "Fetch a user record by ID. "
-            "Returns name, email, department, role, status, last_login, mfa_enabled. "
-            "Returns an error dict if user not found."
-        ),
+        "description": "Fetch a user record by ID (returns: name, email, department, role, status, last_login, mfa_enabled)",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -103,7 +99,7 @@ USER_TOOLS = [
     },
     {
         "name": "find_user_by_email",
-        "description": "Look up a user by their email address. Useful when you have an email but not a user ID.",
+        "description": "Look up a user by email address",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -114,11 +110,7 @@ USER_TOOLS = [
     },
     {
         "name": "get_user_activity",
-        "description": (
-            "Get recent activity log for a user. "
-            "Returns up to 100 events from the last N days (default 30). "
-            "Each event has: action, resource, timestamp, ip_address, success."
-        ),
+        "description": "Get recent activity log for a user (returns: action, resource, timestamp, ip_address, success)",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -130,11 +122,7 @@ USER_TOOLS = [
     },
     {
         "name": "get_user_permissions",
-        "description": (
-            "Get all permissions assigned to a user. "
-            "Returns list of permissions with name, resource, level (read/write/admin). "
-            "High-risk permissions (admin/write to sensitive resources) are flagged."
-        ),
+        "description": "Get all permissions assigned to a user (with level: read/write/admin)",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -145,7 +133,7 @@ USER_TOOLS = [
     },
     {
         "name": "get_audit_log",
-        "description": "Get the audit log of administrative actions taken on a user account (flags, deactivations, permission changes).",
+        "description": "Get audit log of administrative actions on a user account",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -156,12 +144,7 @@ USER_TOOLS = [
     },
     {
         "name": "flag_user",
-        "description": (
-            "Flag a user account for review. Sets status to 'flagged'. "
-            "Does NOT deactivate the account — user can still log in. "
-            "Use when suspicious activity is detected but not confirmed. "
-            "Always provide a clear reason."
-        ),
+        "description": "Flag a user account for review (requires: reason). Account remains active.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -173,11 +156,7 @@ USER_TOOLS = [
     },
     {
         "name": "deactivate_user",
-        "description": (
-            "Permanently deactivate a user account. Sets status to 'inactive'. "
-            "This blocks all future logins. Use only after confirmation. "
-            "Always provide a clear reason for the audit log."
-        ),
+        "description": "Permanently deactivate a user account (requires: reason). Blocks all logins.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -189,10 +168,7 @@ USER_TOOLS = [
     },
     {
         "name": "get_prior_assessment",
-        "description": (
-            "Return the most recent saved risk assessment for a user. "
-            "Returns {none: true} if no prior assessment exists."
-        ),
+        "description": "Get the most recent saved risk assessment for a user",
         "input_schema": {
             "type": "object",
             "properties": {
