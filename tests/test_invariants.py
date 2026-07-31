@@ -245,7 +245,84 @@ def test_no_skill_combination_exceeds_the_cache_limit():
     return True, f"worst case {worst}/{MAX_CACHE_BREAKPOINTS} over all 1-4 skill combinations"
 
 
+# ── Client <-> orchestrator flow_type contract ────────────────────
+
+CLI_PY = ROOT / "client" / "cli.py"
+APP_PY = ROOT / "orchestrator" / "app.py"
+
+# Endpoints the client can reach that dispatch on flow_type.
+FLOW_ENDPOINTS = ("run_flow_endpoint", "run_flow_stream_endpoint")
+
+
+def _client_flow_types() -> set[str]:
+    """flow_type strings the client menu can send (3rd element of each entry)."""
+    tree = ast.parse(CLI_PY.read_text())
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for value in node.values:
+                if isinstance(value, ast.Tuple) and len(value.elts) >= 3:
+                    third = value.elts[2]
+                    if isinstance(third, ast.Constant) and isinstance(third.value, str):
+                        found.add(third.value)
+    return found
+
+
+def _handled_flow_types(endpoint: str) -> set[str]:
+    """flow_type literals compared against req.flow_type inside one endpoint."""
+    tree = ast.parse(APP_PY.read_text())
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == endpoint), None)
+    if fn is None:
+        raise AssertionError(f"endpoint {endpoint}() not found in app.py")
+    handled = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Compare) and "req.flow_type" in ast.unparse(node.left):
+            for comp in node.comparators:
+                if isinstance(comp, ast.Constant) and isinstance(comp.value, str):
+                    handled.add(comp.value)
+                elif isinstance(comp, (ast.Tuple, ast.List, ast.Set)):
+                    handled |= {e.value for e in comp.elts
+                                if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    return handled
+
+
+def test_every_client_flow_type_is_handled_by_every_endpoint():
+    """
+    The client offers nine options; each maps to a flow_type sent to the
+    orchestrator. Both /flow and /flow/stream dispatch on it independently, so
+    a flow_type added to one and not the other fails only at runtime, for
+    whichever endpoint the client happens to use.
+
+    Regression: option 9 sent "risk-parallel-memory", which /flow handled and
+    /flow/stream did not. The client streams, so option 9 returned
+    "Unknown flow_type: risk-parallel-memory" while the non-streaming endpoint
+    worked fine.
+    """
+    client = _client_flow_types()
+    if not client:
+        return False, "parsed no flow_types from the client menu — parser is out of date"
+    for endpoint in FLOW_ENDPOINTS:
+        unhandled = client - _handled_flow_types(endpoint)
+        if unhandled:
+            return False, (f"{endpoint}() does not handle {sorted(unhandled)} — the client "
+                           f"can send these and will get 'Unknown flow_type'")
+    return True, f"{len(client)} client flow_types handled by both endpoints"
+
+
+def test_both_endpoints_handle_the_same_flow_types():
+    """Neither endpoint should silently support more than the other."""
+    a, b = (_handled_flow_types(e) for e in FLOW_ENDPOINTS)
+    if a != b:
+        only_a, only_b = sorted(a - b), sorted(b - a)
+        return False, (f"{FLOW_ENDPOINTS[0]} only: {only_a}; "
+                       f"{FLOW_ENDPOINTS[1]} only: {only_b}")
+    return True, f"both endpoints handle the same {len(a)} flow_types"
+
+
 TESTS = [
+    test_every_client_flow_type_is_handled_by_every_endpoint,
+    test_both_endpoints_handle_the_same_flow_types,
     test_user_tools_schemas_are_wellformed,
     test_tool_names_are_unique,
     test_every_declared_tool_exists_on_the_mcp_server,

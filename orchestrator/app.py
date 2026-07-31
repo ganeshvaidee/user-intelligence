@@ -153,6 +153,13 @@ async def run_flow_stream_endpoint(req: FlowRequest):
                     result, _ = await run_flow_parallel_risk(req.user_request, verbose=False, thinking=_thinking)
                     yield result
                 gen = _parallel_gen()
+            elif req.flow_type == "risk-parallel-memory":
+                # Note: unlike run_flow_parallel_risk, the memory variant returns
+                # the report alone, not (report, tools_called) — do not unpack.
+                async def _memory_gen():
+                    result = await run_flow_parallel_risk_with_memory(req.user_request, verbose=False)
+                    yield result
+                gen = _memory_gen()
             else:
                 yield f"data: {json.dumps({'error': f'Unknown flow_type: {req.flow_type}'})}\n\n"
                 return
