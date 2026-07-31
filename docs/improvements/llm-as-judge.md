@@ -34,7 +34,7 @@ The Anthropic API's `tool_choice` parameter controls whether Claude must call a 
 | `{"type": "any"}` | Claude must call one of the provided tools |
 | `{"type": "tool", "name": "x"}` | Claude must call tool `x` specifically |
 
-By passing a single judge tool and setting `tool_choice={"type": "any"}`, Claude is forced to call that tool — it cannot respond with prose. The result is always a `tool_use` block, which is parsed directly:
+By passing a single judge tool and setting `tool_choice={"type": "any"}`, Claude is forced to call that tool — it cannot respond with prose. The result is normally a `tool_use` block, parsed straight into a dict:
 
 ```python
 result = await client.messages.create(
@@ -42,11 +42,13 @@ result = await client.messages.create(
     tool_choice = {"type": "any"},      # forces tool_use, never text
     ...
 )
-return next(b for b in result.content if b.type == "tool_use").input
-# → always returns a dict — no string parsing, no regex, no fragile extraction
+return _first_tool_input(result, {"complete": True, "missing": [], "judge_unavailable": True})
+# → a dict — no string parsing, no regex, no fragile extraction
 ```
 
 This is a general pattern for getting structured output from Claude without needing a separate parsing step.
+
+"Forced" is not "guaranteed", though — a `max_tokens` truncation, a refusal, or a provider-side stop can all end a turn with no complete `tool_use` block. `_first_tool_input` is what handles that; see **When the judge can't be read** below.
 
 **On `MODEL_ID`:** the judges use the same model as the main flow, imported from `flows/llm_client.py`. That module selects the provider at import time — `BEDROCK_MODEL_ID` from `bedrock_client.py` when running on Bedrock, `MODEL_ID` from `anthropic_client.py` when calling the Anthropic API directly — and re-exports both as `MODEL_ID`. Judge code never references the provider-specific name.
 
@@ -88,7 +90,7 @@ _COMPLETENESS_TOOL = {
 async def _check_completeness(original_request: str, response: str) -> dict:
     result = await client.messages.create(
         model       = MODEL_ID,
-        max_tokens  = 512,
+        max_tokens  = 1024,   # 512 could truncate a long list mid-block
         system      = [{"type": "text", "text": "You are a quality checker for user intelligence assessments. Be precise and critical.", "cache_control": {"type": "ephemeral"}}],
         tools       = [_COMPLETENESS_TOOL],
         tool_choice = {"type": "any"},
@@ -101,7 +103,9 @@ async def _check_completeness(original_request: str, response: str) -> dict:
             ),
         }],
     )
-    return next(b for b in result.content if b.type == "tool_use").input
+    return _first_tool_input(
+        result, {"complete": True, "missing": [], "judge_unavailable": True}
+    )
 ```
 
 ### What it returns
@@ -110,6 +114,8 @@ async def _check_completeness(original_request: str, response: str) -> dict:
 {"complete": True,  "missing": []}
 # or
 {"complete": False, "missing": ["Audit log not checked", "Account age not mentioned"]}
+# or, when the verdict could not be read:
+{"complete": True,  "missing": [], "judge_unavailable": True}
 ```
 
 ### How the result is used
@@ -117,6 +123,12 @@ async def _check_completeness(original_request: str, response: str) -> dict:
 ```python
 check   = await _check_completeness(user_request, all_text)
 missing = check.get("missing") or []   # defensive — LLMs sometimes omit empty arrays
+
+if check.get("judge_unavailable"):
+    warnings.append(
+        f"Completeness judge returned no verdict on round {round_num} — "
+        f"this response was NOT checked for completeness."
+    )
 
 if check.get("complete"):
     break   # done
@@ -202,7 +214,7 @@ _CRITIQUE_TOOL = {
 async def _critique_response(original_request: str, response: str) -> dict:
     result = await client.messages.create(
         model       = MODEL_ID,
-        max_tokens  = 512,
+        max_tokens  = 1024,   # 512 could truncate a long list mid-block
         system      = [{"type": "text", "text": "You are a critical reviewer of user intelligence risk assessments. Check that risk scores are justified by the evidence shown. Flag any score inflation, unsupported conclusions, or missing caveats.", "cache_control": {"type": "ephemeral"}}],
         tools       = [_CRITIQUE_TOOL],
         tool_choice = {"type": "any"},
@@ -215,7 +227,9 @@ async def _critique_response(original_request: str, response: str) -> dict:
             ),
         }],
     )
-    return next(b for b in result.content if b.type == "tool_use").input
+    return _first_tool_input(
+        result, {"has_issues": False, "issues": [], "judge_unavailable": True}
+    )
 ```
 
 ### What it returns
@@ -224,6 +238,8 @@ async def _critique_response(original_request: str, response: str) -> dict:
 {"has_issues": False, "issues": []}
 # or
 {"has_issues": True,  "issues": ["Risk score of 12 not justified — no evidence cited for off-hours activity", "Contractor status mentioned but not scored"]}
+# or, when the verdict could not be read:
+{"has_issues": False, "issues": [], "judge_unavailable": True}
 ```
 
 ### How the result is used
@@ -232,8 +248,14 @@ async def _critique_response(original_request: str, response: str) -> dict:
 critique = await _critique_response(user_request, initial_text)
 issues   = critique.get("issues") or []
 
+if critique.get("judge_unavailable"):
+    warnings.append(
+        "Critic returned no verdict — this response was NOT reviewed for "
+        "errors or unjustified claims."
+    )
+
 if not critique.get("has_issues") or not issues:
-    return initial_text   # no revision needed — return immediately
+    return initial_text, warnings   # no revision needed — return immediately
 
 issues_text = "\n".join(f"- {issue}" for issue in issues)
 messages.append({
@@ -247,12 +269,67 @@ _, revised_text = await _run_tool_loop(
     system_prompt, messages, session, verbose, seen_calls,
     tools=tools, completed=completed,     # ← security guardrails carry into the revision
 )
-return revised_text
+return revised_text, warnings
 ```
+
+Both blocking flows return `tuple[str, list[str]]` — the text plus any degradation warnings. `warnings` is empty on a normal run.
 
 The revision happens in the same conversation thread — Claude sees all prior tool results and can correct without re-fetching data.
 
 Note the `tools=` and `completed=` arguments. The revision pass runs under the **same** guardrails as the initial pass: `tools` is the skill-scoped tool list from `tools_for_skills(skill_names)`, and `completed` is the set of tools that have already succeeded, carried forward so the order guard (`ORDER_REQUIREMENTS`) does not reset. A critic cannot widen Claude's tool access, and Claude cannot use the revision pass to reach a tool the flow's skills never declared.
+
+---
+
+## When the judge can't be read
+
+`tool_choice={"type": "any"}` makes a prose reply unlikely, not impossible. A `max_tokens` truncation part-way through the block, a refusal, or a provider-side stop can all end the turn with no readable `tool_use`. Both judges route their result through one helper in `flows/tools.py`:
+
+```python
+def _first_tool_input(result, default: dict) -> dict:
+    block = next((b for b in result.content if b.type == "tool_use"), None)
+    if block is None:
+        logger.warning(
+            "Judge returned no tool_use block (stop_reason=%s) — failing open with %s",
+            getattr(result, "stop_reason", "unknown"), default,
+        )
+        return default
+    return block.input
+```
+
+### Fail open, not closed
+
+The defaults are chosen so a lost verdict is **inert**:
+
+| Judge | Fallback | Effect |
+|---|---|---|
+| Completeness | `{"complete": True, "missing": []}` | Loop stops — no extra round |
+| Critic | `{"has_issues": False, "issues": []}` | No revision pass — initial response returned |
+
+This is safe because the judge is **additive, not load-bearing**. `run_flow()` returns Claude's answer with no judge at all and that's a supported mode; the judged flows are the same thing plus optional extra passes. Degrading to "behave like `run_flow`" returns a response the system already treats as valid.
+
+Failing *closed* would be actively worse. With `complete: False, missing: []`, the loop doesn't break and then sends Claude the literal string `"Your response is incomplete. Please also check:\n"` — an instruction with nothing after the colon. That burns a full agentic round, and repeats every round until `max_rounds`.
+
+> ⚠️ **This reasoning does not generalise.** It holds because this judge gates *thoroughness*. The safety gates in this codebase deliberately fail **closed** and are not LLM-judged at all: the order guard (`ORDER_REQUIREMENTS`, a plain list comprehension), the HITL confirmation split, and per-flow tool visibility. If a judge were deciding whether an account is safe to deactivate, `True` would be indefensible.
+
+### The verdict stays distinguishable
+
+The fallback also carries `"judge_unavailable": True`. Without it a degraded verdict is byte-identical to a genuine pass, and callers report a check that never happened. Genuine verdicts come straight off the model's `tool_use` block and never carry the key, so `check.get("judge_unavailable")` is an exact test.
+
+### How it surfaces
+
+The flag propagates out of the flow rather than dying in a log line:
+
+| Layer | Signal |
+|---|---|
+| `flows/tools.py` | `logger.warning(...)` with the `stop_reason` |
+| Verbose CLI | `[CONVERGENCE] Round N ⚠ judge unavailable — stopping with the response UNVERIFIED` / `[REFLECTION] ⚠ Critic unavailable — returning initial response UNREVIEWED.` |
+| Blocking flows | Return `tuple[str, list[str]]` — the second element carries a human-readable warning per degraded round |
+| Streaming flows | `yield {"warning": ...}` — an out-of-band event, not response text |
+| `POST /flow` | `FlowResponse.warnings: list[str]` (empty on a clean run) |
+| `POST /flow/stream` | `data: {"warning": "..."}` alongside the `text` / `done` events |
+| Client CLI | `⚠  WARNING: ...` on **stderr**, so piped stdout stays clean |
+
+Before this, the verbose output printed `✓ complete` and `No issues found` on a degraded verdict — asserting a judgement that was never made.
 
 ---
 
@@ -267,6 +344,7 @@ Note the `tools=` and `completed=` arguments. The revision pass runs under the *
 | Output drives | Whether to continue looping | Whether to revise |
 | On positive result | Break the loop | Return initial response immediately |
 | On negative result | Append missing items, loop again | Append issues, run revision pass |
+| On unreadable verdict | Break, flag `judge_unavailable`, warn | Return initial response, flag + warn |
 
 ---
 
@@ -280,13 +358,9 @@ Note the `tools=` and `completed=` arguments. The revision pass runs under the *
 
 **Judge system prompts are generic.** Both judges use short generic prompts. The completeness judge doesn't know what a *complete* risk assessment looks like; it infers from context. A more specific prompt with a rubric would catch more genuine gaps.
 
-**A judge that returns no tool block crashes the flow.** Both judges end with:
+**A lost verdict means the response ships unchecked.** This is the residual cost of failing open (see **When the judge can't be read** above): a genuinely incomplete or flawed response can be returned as final when the judge call breaks. It is surfaced — a `WARNING` log, a verbose `⚠` line, and a `warnings` entry on the API response — but it is not prevented, and nothing retries the judge.
 
-```python
-return next(b for b in result.content if b.type == "tool_use").input
-```
-
-`tool_choice={"type": "any"}` makes a text-only response unlikely, but `next()` on an empty iterator raises `StopIteration` — and there is no `default` argument and no try/except. If it happens (a refusal, a `max_tokens` truncation mid-block, a provider-side stop), the exception propagates out of the flow function and the orchestrator returns a 500 with no partial result, discarding work Claude has already completed. A `next(..., None)` with a fail-open fallback (`{"complete": True}` / `{"has_issues": False}`) would degrade to "no judge this round" instead of losing the whole response.
+*Previously this was worse:* both judges ended with a bare `next(b for b in result.content if b.type == "tool_use").input`, and `StopIteration` on an empty iterator propagated out as an opaque `RuntimeError`, giving a 500 and discarding work Claude had already finished. The trade is now "occasionally under-checked, and reported" instead of "occasionally lose the response, loudly".
 
 **The judge is not applied to the parallel risk flows.** Options 7–9 (`run_flow_parallel_risk`, `run_flow_parallel_risk_with_memory`) fan out to four dimension agents and merge them in `_synthesize_risk_report()` — pure Python string assembly plus a threshold lookup. No LLM adjudicates the four independent scores. Those agents do use the same forced-`tool_choice` structured-output technique (`report_dimension_score`), but as reporters, not as judges.
 

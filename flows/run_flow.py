@@ -56,6 +56,23 @@ def _build_system_prompt(skills_content: str) -> str:
     )
 
 
+def _cache_tools(tools: list[dict] | None) -> list[dict]:
+    """
+    Put a single cache breakpoint on the LAST tool.
+
+    The API allows at most 4 cache_control blocks per request and caches the
+    entire prefix up to the last breakpoint — so one marker on the final tool
+    already caches every tool before it. Marking every tool spends a breakpoint
+    per tool and returns
+        400 "A maximum of 4 blocks with cache_control may be provided"
+    as soon as a flow exposes more than three tools (the system prompt uses the
+    fourth). Caching behaviour is identical; only the breakpoint count differs.
+    """
+    if not tools:
+        return []
+    return [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}]
+
+
 def _print_header(user_request: str, skill_names: list[str]) -> None:
     print(f"\n{'='*60}")
     print(f"REQUEST: {user_request}")
@@ -86,7 +103,7 @@ async def _run_tool_loop(
         completed = set()
     active_tools = tools if tools is not None else USER_TOOLS
 
-    cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in active_tools] if active_tools else []
+    cached_tools = _cache_tools(active_tools)
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 
     while True:
@@ -188,7 +205,7 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
     system_prompt  = _build_system_prompt(load_skill(*skill_names))
     messages       = [{"role": "user", "content": user_request}]
     tools = tools_for_skills(skill_names)
-    cached_tools   = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in tools] if tools else []
+    cached_tools   = _cache_tools(tools)
     cached_system  = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
     completed: set[str] = set()
@@ -255,7 +272,7 @@ async def run_flow_until_complete_stream(
     system_prompt = _build_system_prompt(load_skill(*skill_names))
     messages      = [{"role": "user", "content": user_request}]
     tools = tools_for_skills(skill_names)
-    cached_tools  = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in tools] if tools else []
+    cached_tools  = _cache_tools(tools)
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
     completed: set[str] = set()
@@ -319,6 +336,13 @@ async def run_flow_until_complete_stream(
         check   = await _check_completeness(user_request, round_text)
         missing = check.get("missing") or []
 
+        if check.get("judge_unavailable"):
+            # Out-of-band event, not response text. app.py forwards dicts as-is.
+            yield {"warning": (
+                f"Completeness judge returned no verdict on round {round_num} — "
+                f"this response was NOT checked for completeness."
+            )}
+
         if check.get("complete") or not missing:
             break
 
@@ -339,7 +363,7 @@ async def run_flow_with_reflection_stream(
     """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
     tools = tools_for_skills(skill_names)
-    cached_tools  = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in tools] if tools else []
+    cached_tools  = _cache_tools(tools)
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
     completed: set[str] = set()
@@ -386,6 +410,13 @@ async def run_flow_with_reflection_stream(
     # ── Phase 2 — critic (silent) ─────────────────────────────────
     critique = await _critique_response(user_request, initial_text)
     issues   = critique.get("issues") or []
+
+    if critique.get("judge_unavailable"):
+        # Out-of-band event, not response text. app.py forwards dicts as-is.
+        yield {"warning": (
+            "Critic returned no verdict — this response was NOT reviewed for "
+            "errors or unjustified claims."
+        )}
 
     if not critique.get("has_issues") or not issues:
         return
@@ -436,13 +467,17 @@ async def run_flow_until_complete(
     skill_names: list[str],
     max_rounds: int = 3,
     verbose: bool = True,
-) -> str:
+) -> tuple[str, list[str]]:
     """
     Convergence loop: after each round a second LLM call checks whether the
     response is complete. If not, the missing items are fed back as a follow-up
     in the same conversation and Claude runs another tool-use pass.
     A fresh MCP session is opened per round so the connection does not time
     out during the completeness check between rounds.
+
+    Returns (response_text, warnings). `warnings` is empty on a normal run and
+    carries one entry per round where the judge returned no readable verdict —
+    the caller needs this to know the response went out unverified.
     """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
     tools = tools_for_skills(skill_names)
@@ -454,6 +489,7 @@ async def run_flow_until_complete(
     all_text   = ""
     seen_calls = {}
     completed: set[str] = set()
+    warnings: list[str] = []
 
     for round_num in range(1, max_rounds + 1):
         if verbose and round_num > 1:
@@ -471,8 +507,18 @@ async def run_flow_until_complete(
         check   = await _check_completeness(user_request, all_text)
         missing = check.get("missing") or []
 
+        if check.get("judge_unavailable"):
+            warnings.append(
+                f"Completeness judge returned no verdict on round {round_num} — "
+                f"this response was NOT checked for completeness."
+            )
+
         if verbose:
-            if check.get("complete"):
+            if check.get("judge_unavailable"):
+                # Not a pass — the judge call returned no readable verdict.
+                print(f"\n[CONVERGENCE] Round {round_num} ⚠ judge unavailable — "
+                      f"stopping with the response UNVERIFIED")
+            elif check.get("complete"):
                 print(f"\n[CONVERGENCE] Round {round_num} ✓ complete")
             else:
                 print(f"\n[CONVERGENCE] Round {round_num} incomplete — missing: {missing}")
@@ -486,19 +532,23 @@ async def run_flow_until_complete(
             "content": f"Your response is incomplete. Please also check:\n{missing_text}",
         })
 
-    return all_text
+    return all_text, warnings
 
 
 async def run_flow_with_reflection(
     user_request: str,
     skill_names: list[str],
     verbose: bool = True,
-) -> str:
+) -> tuple[str, list[str]]:
     """
     Critic-revise: runs the flow once, then a second LLM call critiques the
     output. If issues are found, Claude revises within the same conversation
     thread — it has full context of every tool call it already made.
     One MCP server process spans both the initial pass and the revision.
+
+    Returns (response_text, warnings). `warnings` carries an entry when the
+    critic returned no readable verdict, so the caller knows the response was
+    never actually reviewed.
     """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
     tools = tools_for_skills(skill_names)
@@ -509,6 +559,7 @@ async def run_flow_with_reflection(
 
     seen_calls = {}
     completed: set[str] = set()
+    warnings: list[str] = []
 
     async with start_mcp_session() as session:
         # Phase 1 — initial response
@@ -529,10 +580,21 @@ async def run_flow_with_reflection(
         critique = await _critique_response(user_request, initial_text)
         issues   = critique.get("issues") or []
 
+        if critique.get("judge_unavailable"):
+            warnings.append(
+                "Critic returned no verdict — this response was NOT reviewed for "
+                "errors or unjustified claims."
+            )
+
         if not critique.get("has_issues") or not issues:
             if verbose:
-                print("[REFLECTION] No issues found — returning initial response.")
-            return initial_text
+                if critique.get("judge_unavailable"):
+                    # Not a clean review — the critic call returned no readable verdict.
+                    print("[REFLECTION] ⚠ Critic unavailable — returning initial "
+                          "response UNREVIEWED.")
+                else:
+                    print("[REFLECTION] No issues found — returning initial response.")
+            return initial_text, warnings
 
         if verbose:
             print("[REFLECTION] Issues found:")
@@ -552,7 +614,7 @@ async def run_flow_with_reflection(
 
         _, revised_text = await _run_tool_loop(system_prompt, messages, session, verbose, seen_calls, tools=tools, completed=completed)
 
-    return revised_text
+    return revised_text, warnings
 
 
 # ── Parallel multi-agent risk scoring ────────────────────────────
@@ -604,7 +666,7 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
     messages      = [{"role": "user", "content": f"Score the {dimension} risk dimension for user {user_id}."}]
     base_tools    = _DIMENSION_TOOLS[dimension]
     all_tools     = base_tools + [_DIMENSION_SCORE_TOOL]
-    cached_tools  = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in all_tools]
+    cached_tools  = _cache_tools(all_tools)
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     score_result  = None
     tools_called: list[str] = []
@@ -918,18 +980,20 @@ async def example_find_by_email():
 
 
 async def example_risk_with_convergence():
-    return await run_flow_until_complete(
+    text, _warnings = await run_flow_until_complete(
         user_request = "Give me a thorough risk assessment for usr_005",
         skill_names  = ["_base", "lookup-user", "user-risk-profile"],
         max_rounds   = 3,
     )
+    return text
 
 
 async def example_risk_with_reflection():
-    return await run_flow_with_reflection(
+    text, _warnings = await run_flow_with_reflection(
         user_request = "Give me a risk assessment for usr_005",
         skill_names  = ["_base", "lookup-user", "user-risk-profile"],
     )
+    return text
 
 
 async def example_parallel_risk():

@@ -52,6 +52,10 @@ class FlowRequest(BaseModel):
 class FlowResponse(BaseModel):
     response:  str
     flow_type: str
+    # Non-fatal degradations the caller should know about — currently populated
+    # when a judge/critic call returned no readable verdict, meaning the
+    # response was returned without the check the flow_type implies.
+    warnings:  list[str] = []
 
 
 class OffboardRequest(BaseModel):
@@ -76,18 +80,19 @@ async def run_flow_endpoint(req: FlowRequest):
       convergence — loop until a completeness check passes
       reflection  — run once, critique, revise if issues found
     """
+    warnings: list[str] = []
     try:
         if req.flow_type == "single":
             result = await run_flow(req.user_request, req.skill_names, verbose=False)
 
         elif req.flow_type == "convergence":
-            result = await run_flow_until_complete(
+            result, warnings = await run_flow_until_complete(
                 req.user_request, req.skill_names,
                 max_rounds=req.max_rounds, verbose=False,
             )
 
         elif req.flow_type == "reflection":
-            result = await run_flow_with_reflection(
+            result, warnings = await run_flow_with_reflection(
                 req.user_request, req.skill_names, verbose=False,
             )
 
@@ -115,7 +120,10 @@ async def run_flow_endpoint(req: FlowRequest):
         logger.error("Flow error:\n%s", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
-    return FlowResponse(response=result, flow_type=req.flow_type)
+    if warnings:
+        logger.warning("Flow '%s' completed with warnings: %s", req.flow_type, warnings)
+
+    return FlowResponse(response=result, flow_type=req.flow_type, warnings=warnings)
 
 
 @app.post("/flow/stream")
@@ -150,7 +158,14 @@ async def run_flow_stream_endpoint(req: FlowRequest):
                 return
 
             async for chunk in gen:
-                yield f"data: {json.dumps({'text': chunk})}\n\n"
+                # Flows yield plain strings for response text, and dicts for
+                # out-of-band events (currently {"warning": ...}). Forward dicts
+                # verbatim so the client can distinguish them from content.
+                if isinstance(chunk, dict):
+                    logger.warning("Flow '%s' emitted: %s", req.flow_type, chunk)
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                else:
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
         except Exception as e:
             logger.error("Stream error:\n%s", traceback.format_exc())

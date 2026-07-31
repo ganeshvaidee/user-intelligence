@@ -109,6 +109,11 @@ def call_orchestrator_stream(user_request: str, skill_names: list, flow_type: st
                     if "error" in event:
                         print(f"\nERROR: {event['error']}")
                         sys.exit(1)
+                    if "warning" in event:
+                        # Not response content — a degradation notice, e.g. a
+                        # judge that returned no verdict. Keep it off stdout so
+                        # piped output stays clean.
+                        print(f"\n⚠  WARNING: {event['warning']}", file=sys.stderr)
                     if "text" in event:
                         print(event["text"], end="", flush=True)
     except httpx.ConnectError:
@@ -129,7 +134,10 @@ def call_orchestrator(user_request: str, skill_names: list, flow_type: str) -> s
                 "flow_type":    flow_type,
             })
             response.raise_for_status()
-            return response.json()["response"]
+            payload = response.json()
+            for warning in payload.get("warnings", []):
+                print(f"\n⚠  WARNING: {warning}", file=sys.stderr)
+            return payload["response"]
     except httpx.ConnectError:
         print(f"\nERROR: Could not connect to orchestrator at {ORCHESTRATOR_URL}")
         print("Is it running?  MCP_URL=http://localhost:8001 python orchestrator/app.py")
@@ -156,6 +164,11 @@ def call_offboard_phase_stream(endpoint: str, user_id: str, reason: str) -> None
                     if "error" in event:
                         print(f"\nERROR: {event['error']}")
                         sys.exit(1)
+                    if "warning" in event:
+                        # Not response content — a degradation notice, e.g. a
+                        # judge that returned no verdict. Keep it off stdout so
+                        # piped output stays clean.
+                        print(f"\n⚠  WARNING: {event['warning']}", file=sys.stderr)
                     if "text" in event:
                         print(event["text"], end="", flush=True)
     except httpx.ConnectError:

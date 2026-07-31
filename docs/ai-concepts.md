@@ -256,13 +256,13 @@ Prompt caching marks static content with `cache_control: {type: ephemeral}` so t
 system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 ```
 
-**Tools list** — `USER_TOOLS` never changes within a flow. The cache breakpoint is added to all tool entries:
+**Tools list** — the tool list never changes within a flow. A single cache breakpoint goes on the **last** tool, via the `_cache_tools()` helper in `run_flow.py`:
 
 ```python
-cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in USER_TOOLS]
+cached_tools = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}]
 ```
 
-The API caches all tools up to and including the last entry.
+The API caches all tools up to and including that entry, so one marker covers the whole list. Marking every tool instead would exceed the **4 breakpoints per request** limit and return a `400` — see `docs/improvements/prompt-caching.md`.
 
 **Judge system prompts** — `_check_completeness` and `_critique_response` also cache their static system strings. Low individual gain but correct practice — the system prompt is cached after the first judge call and served from cache in any subsequent rounds.
 

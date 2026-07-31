@@ -9,6 +9,7 @@
 #                       structured LLM calls and return parsed dicts)
 
 import json
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -22,6 +23,8 @@ from llm_client import client, MODEL_ID
 
 MCP_SERVER = Path(__file__).parent.parent / "mcp-server" / "server.py"
 MCP_URL    = os.environ.get("MCP_URL")   # set to use HTTP mode, e.g. http://localhost:8001
+
+logger = logging.getLogger(__name__)
 
 
 # ── MCP session lifecycle ─────────────────────────────────────────
@@ -265,11 +268,39 @@ async def execute_tool(session: ClientSession, name: str, inputs: dict) -> str:
 
 # ── LLM judge callers ─────────────────────────────────────────────
 
+def _first_tool_input(result, default: dict) -> dict:
+    """
+    Pull the judge's verdict out of its forced tool_use block.
+
+    tool_choice={"type": "any"} makes a text-only reply unlikely but not
+    impossible — a max_tokens truncation, a refusal, or a provider-side stop
+    can all end a turn with no complete tool_use block. Bare next() would raise
+    StopIteration there, which inside a coroutine surfaces as an opaque
+    RuntimeError and takes down the whole flow.
+
+    Fail open instead: a missing verdict means "no judge this round", never
+    "throw away the response Claude already produced".
+
+    The caller's `default` should carry "judge_unavailable": True so the
+    degraded verdict stays distinguishable from a genuine one. Without that
+    tag a fail-open result is byte-identical to a real pass, and callers end
+    up reporting a verdict that was never given.
+    """
+    block = next((b for b in result.content if b.type == "tool_use"), None)
+    if block is None:
+        logger.warning(
+            "Judge returned no tool_use block (stop_reason=%s) — failing open with %s",
+            getattr(result, "stop_reason", "unknown"), default,
+        )
+        return default
+    return block.input
+
+
 async def _check_completeness(original_request: str, response: str) -> dict:
     """Ask the LLM whether a response fully covers the original request."""
     result = await client.messages.create(
         model       = MODEL_ID,
-        max_tokens  = 512,
+        max_tokens  = 1024,   # 512 could truncate a long `missing`/`issues` list mid-block
         system      = [{"type": "text", "text": "You are a quality checker for user intelligence assessments. Be precise and critical.", "cache_control": {"type": "ephemeral"}}],
         tools       = [_COMPLETENESS_TOOL],
         tool_choice = {"type": "any"},
@@ -282,14 +313,19 @@ async def _check_completeness(original_request: str, response: str) -> dict:
             ),
         }],
     )
-    return next(b for b in result.content if b.type == "tool_use").input
+    # Fail open as "complete" — a lost verdict must not force an extra round.
+    # judge_unavailable marks this as "not actually checked", so callers don't
+    # report it as a passed completeness check.
+    return _first_tool_input(
+        result, {"complete": True, "missing": [], "judge_unavailable": True}
+    )
 
 
 async def _critique_response(original_request: str, response: str) -> dict:
     """Ask the LLM to critique an assessment for errors and unjustified claims."""
     result = await client.messages.create(
         model       = MODEL_ID,
-        max_tokens  = 512,
+        max_tokens  = 1024,   # 512 could truncate a long `missing`/`issues` list mid-block
         system      = [{"type": "text", "text": "You are a critical reviewer of user intelligence risk assessments. Check that risk scores are justified by the evidence shown. Flag any score inflation, unsupported conclusions, or missing caveats.", "cache_control": {"type": "ephemeral"}}],
         tools       = [_CRITIQUE_TOOL],
         tool_choice = {"type": "any"},
@@ -302,4 +338,9 @@ async def _critique_response(original_request: str, response: str) -> dict:
             ),
         }],
     )
-    return next(b for b in result.content if b.type == "tool_use").input
+    # Fail open as "no issues" — a lost verdict must not trigger a revision pass.
+    # judge_unavailable marks this as "not actually reviewed", so callers don't
+    # report it as a clean critique.
+    return _first_tool_input(
+        result, {"has_issues": False, "issues": [], "judge_unavailable": True}
+    )

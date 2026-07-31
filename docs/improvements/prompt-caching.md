@@ -30,11 +30,22 @@ system = [
 ]
 ```
 
-For tools, add `cache_control` to all tools in the list. The API caches everything up to and including the last entry:
+For tools, put **one** breakpoint on the **last** tool. The API caches everything up to and including that entry, so a single marker covers every tool before it:
 
 ```python
-cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in USER_TOOLS]
+def _cache_tools(tools: list[dict] | None) -> list[dict]:
+    if not tools:
+        return []
+    return [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}]
 ```
+
+> ⚠️ **Do not mark every tool.** The API allows at most **4** `cache_control` blocks per request. Marking each tool spends one breakpoint per tool, and with the system prompt taking a fourth, any flow exposing more than three tools fails outright:
+>
+> ```
+> 400 invalid_request_error — A maximum of 4 blocks with cache_control may be provided. Found 6.
+> ```
+>
+> This is not a tuning issue — the request never reaches the model. Caching behaviour is identical either way; only the breakpoint count differs.
 
 `cache_control: {type: ephemeral}` means the cache lives for 5 minutes — long enough to cover all rounds in a single flow, automatically expiring after.
 
@@ -55,7 +66,7 @@ response = await client.messages.create(
 )
 
 # After
-cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in USER_TOOLS]
+cached_tools = _cache_tools(tools)          # one breakpoint, on the last tool
 response = await client.messages.create(
     model      = MODEL_ID,
     max_tokens = 4096,

@@ -107,7 +107,7 @@ async def run_dimension_agent(dimension: str, user_id: str) -> dict:
     system_prompt = _build_system_prompt(load_skill(f"risk-{dimension}"))
     messages      = [{"role": "user", "content": f"Score the {dimension} risk dimension for user {user_id}."}]
     all_tools     = _DIMENSION_TOOLS[dimension] + [_DIMENSION_SCORE_TOOL]
-    cached_tools  = [*all_tools[:-1], {**all_tools[-1], "cache_control": {"type": "ephemeral"}}]
+    cached_tools  = _cache_tools(all_tools)   # one breakpoint, on the last tool
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     score_result  = None
 
