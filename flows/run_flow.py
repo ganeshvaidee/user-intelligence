@@ -80,6 +80,51 @@ def _print_header(user_request: str, skill_names: list[str]) -> None:
     print(f"{'='*60}\n")
 
 
+async def _dispatch_tool_use(
+    session,
+    block,
+    seen_calls: dict,
+    completed: set[str],
+    verbose: bool = False,
+) -> dict:
+    """
+    Execute one tool_use block and return the tool_result dict to append.
+
+    The single implementation of duplicate detection, the ORDER_REQUIREMENTS
+    order guard, and MCP dispatch. Shared by _run_tool_loop and all four
+    streaming flows.
+
+    This logic used to be copied five times, and the copies had drifted: only
+    the blocking one warned on a duplicate call, so the streaming flows —
+    which are what /flow/stream actually runs — recorded seen_calls and never
+    read it. Adding a guardrail here now covers every flow at once.
+    """
+    cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
+    if cache_key in seen_calls:
+        print(f"[DUPLICATE TOOL CALL] {block.name}({json.dumps(block.input)}) already called — redundant MCP call")
+    else:
+        seen_calls[cache_key] = True
+
+    if verbose:
+        print(f"\n[TOOL CALL] {block.name}({json.dumps(block.input, indent=2)})")
+
+    missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
+    if missing:
+        result = json.dumps({
+            "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
+        })
+    else:
+        result = await execute_tool(session, block.name, block.input)
+        if "error" not in json.loads(result):
+            completed.add(block.name)
+
+    if verbose:
+        display = result[:300] + "..." if len(result) > 300 else result
+        print(f"[TOOL RESULT] {display}\n")
+
+    return {"type": "tool_result", "tool_use_id": block.id, "content": result}
+
+
 async def _run_tool_loop(
     system_prompt: str,
     messages: list[dict],
@@ -135,30 +180,9 @@ async def _run_tool_loop(
                 accumulated_text += block.text
 
             elif block.type == "tool_use":
-                cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
-                if cache_key in seen_calls:
-                    print(f"[DUPLICATE TOOL CALL] {block.name}({json.dumps(block.input)}) already called — redundant MCP call")
-                else:
-                    seen_calls[cache_key] = True
-                if verbose:
-                    print(f"\n[TOOL CALL] {block.name}({json.dumps(block.input, indent=2)})")  # tool calls always printed
-                missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
-                if missing:
-                    result = json.dumps({
-                        "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
-                    })
-                else:
-                    result = await execute_tool(session, block.name, block.input)
-                    if "error" not in json.loads(result):
-                        completed.add(block.name)
-                if verbose:
-                    display = result[:300] + "..." if len(result) > 300 else result
-                    print(f"[TOOL RESULT] {display}\n")
-                tool_results.append({
-                    "type":        "tool_result",
-                    "tool_use_id": block.id,
-                    "content":     result,
-                })
+                tool_results.append(
+                    await _dispatch_tool_use(session, block, seen_calls, completed, verbose)
+                )
 
         msgs.append({"role": "assistant", "content": response.content})
 
@@ -244,23 +268,9 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
 
             for block in response.content:
                 if block.type == "tool_use":
-                    cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
-                    if cache_key not in seen_calls:
-                        seen_calls[cache_key] = True
-                    missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
-                    if missing:
-                        result = json.dumps({
-                            "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
-                        })
-                    else:
-                        result = await execute_tool(session, block.name, block.input)
-                        if "error" not in json.loads(result):
-                            completed.add(block.name)
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": block.id,
-                        "content":     result,
-                    })
+                    tool_results.append(
+                        await _dispatch_tool_use(session, block, seen_calls, completed)
+                    )
 
             messages.append({"role": "assistant", "content": response.content})
             stop = response.stop_reason == "end_turn"
@@ -314,23 +324,9 @@ async def run_flow_until_complete_stream(
 
                 for block in response.content:
                     if block.type == "tool_use":
-                        cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
-                        if cache_key not in seen_calls:
-                            seen_calls[cache_key] = True
-                        missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
-                        if missing:
-                            result = json.dumps({
-                                "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
-                            })
-                        else:
-                            result = await execute_tool(session, block.name, block.input)
-                            if "error" not in json.loads(result):
-                                completed.add(block.name)
-                        tool_results.append({
-                            "type":        "tool_result",
-                            "tool_use_id": block.id,
-                            "content":     result,
-                        })
+                        tool_results.append(
+                            await _dispatch_tool_use(session, block, seen_calls, completed)
+                        )
 
                 round_messages.append({"role": "assistant", "content": response.content})
                 if response.stop_reason == "end_turn":
@@ -399,19 +395,9 @@ async def run_flow_with_reflection_stream(
 
             for block in response.content:
                 if block.type == "tool_use":
-                    cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
-                    if cache_key not in seen_calls:
-                        seen_calls[cache_key] = True
-                    missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
-                    if missing:
-                        result = json.dumps({
-                            "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
-                        })
-                    else:
-                        result = await execute_tool(session, block.name, block.input)
-                        if "error" not in json.loads(result):
-                            completed.add(block.name)
-                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+                    tool_results.append(
+                        await _dispatch_tool_use(session, block, seen_calls, completed)
+                    )
 
             messages.append({"role": "assistant", "content": response.content})
             if response.stop_reason == "end_turn":
@@ -454,19 +440,9 @@ async def run_flow_with_reflection_stream(
 
             for block in response.content:
                 if block.type == "tool_use":
-                    cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
-                    if cache_key not in seen_calls:
-                        seen_calls[cache_key] = True
-                    missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
-                    if missing:
-                        result = json.dumps({
-                            "error": f"Cannot call {block.name} before {', '.join(missing)} has succeeded in this conversation."
-                        })
-                    else:
-                        result = await execute_tool(session, block.name, block.input)
-                        if "error" not in json.loads(result):
-                            completed.add(block.name)
-                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+                    tool_results.append(
+                        await _dispatch_tool_use(session, block, seen_calls, completed)
+                    )
 
             messages.append({"role": "assistant", "content": response.content})
             if response.stop_reason == "end_turn":
