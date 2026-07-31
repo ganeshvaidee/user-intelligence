@@ -67,9 +67,17 @@ result = await client.messages.create(
     tool_choice = {"type": "any"},        # forces a tool_use block
     ...
 )
-return next(b for b in result.content if b.type == "tool_use").input
-# always returns: {"complete": bool, "missing": [...]}
+return _first_tool_input(
+    result, {"complete": True, "missing": [], "judge_unavailable": True}
+)
+# returns: {"complete": bool, "missing": [...]}
 ```
+
+`_first_tool_input()` covers the case where the forced tool call doesn't
+survive — a truncation or refusal leaves no readable block, and a bare
+`next(...)` would raise `StopIteration` and kill the round. It fails open to
+the default and tags it `judge_unavailable`, so the round ends with the
+response intact and the caller is told the check didn't run.
 
 ---
 

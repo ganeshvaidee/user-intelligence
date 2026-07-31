@@ -214,11 +214,15 @@ result = await client.messages.create(
     tool_choice = {"type": "any"},   # Claude MUST call the tool, not write prose
     ...
 )
-# always returns: {"complete": bool, "missing": [...]}
-return next(b for b in result.content if b.type == "tool_use").input
+# returns: {"complete": bool, "missing": [...]}
+return _first_tool_input(
+    result, {"complete": True, "missing": [], "judge_unavailable": True}
+)
 ```
 
-See `docs/improvements/llm-as-judge.md` for the full design, including the two known limitations: judges see only the response text (not the raw tool results), and the unguarded `next()` above raises `StopIteration` if the judge ever returns no tool block.
+`tool_choice` forces a tool call but can't guarantee one — truncation or a refusal can leave no readable block. `_first_tool_input()` fails open to the supplied default and tags it `judge_unavailable`, which propagates out as a `warnings` entry on the API response rather than being silently reported as a passed check.
+
+See `docs/improvements/llm-as-judge.md` for the full design, including the remaining limitation: judges see only the response text, not the raw tool results, so they check plausibility rather than facts.
 
 ---
 

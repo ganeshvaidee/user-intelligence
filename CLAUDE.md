@@ -181,11 +181,22 @@ result = await client.messages.create(
     tool_choice = {"type": "any"},   # forces a tool_use block, not prose
     ...
 )
-return next(b for b in result.content if b.type == "tool_use").input
+return _first_tool_input(
+    result, {"complete": True, "missing": [], "judge_unavailable": True}
+)
 # → {"complete": bool, "missing": [str, ...]}
 ```
 
-This guarantees a parseable dict without fragile JSON extraction from free text.
+This gives a parseable dict without fragile JSON extraction from free text.
+
+`tool_choice` forces a tool call but cannot guarantee one — a `max_tokens`
+truncation or refusal can end the turn with no readable `tool_use` block.
+`_first_tool_input()` (in `flows/tools.py`) handles that by **failing open**:
+it returns the supplied default so the flow keeps its answer instead of
+crashing, and tags it `judge_unavailable` so callers can tell a degraded
+verdict from a real one. Never parse a judge response with a bare
+`next(...)` — that raises `StopIteration` and takes the whole flow down.
+See `docs/improvements/llm-as-judge.md`.
 
 ### Flow 3: `run_flow_with_reflection()` — critic-revise
 

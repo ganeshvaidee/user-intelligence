@@ -165,7 +165,13 @@ async def llm_judge(response: str, rubric: str) -> dict:
         tool_choice = {"type": "any"},
         messages    = [{"role": "user", "content": f"Rubric: {rubric}\n\nResponse:\n{response}"}],
     )
-    return next(b for b in result.content if b.type == "tool_use").input
+    # Reuse the guarded parser from flows/tools.py — a bare next() raises
+    # StopIteration if the judge truncates or refuses. Note an eval judge
+    # should fail *closed*: an unreadable verdict is an inconclusive test,
+    # not a pass.
+    return _first_tool_input(
+        result, {"pass": False, "reason": "judge returned no verdict", "judge_unavailable": True}
+    )
 ```
 
 Example rubric for a risk assessment: *"The response must identify Eve Contractor as high or critical risk, cite no-MFA and external IPs as evidence, and recommend immediate action. The score must be justified by specific data points, not asserted."*
