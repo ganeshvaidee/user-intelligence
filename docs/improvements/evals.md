@@ -2,7 +2,7 @@
 
 ## What evals are
 
-Evals are end-to-end tests of Claude's behaviour given a real user request — not unit tests of Python functions. They run the full pipeline: skill loading → Bedrock API → MCP tool calls → response. No mocking.
+Evals are end-to-end tests of Claude's behaviour given a real user request — not unit tests of Python functions. They run the full pipeline: skill loading → model API (Bedrock or Anthropic, whichever `LLM_PROVIDER` selects) → MCP tool calls → response. No mocking.
 
 This matters because mocked tests can pass while real Claude behaviour silently diverges. A skill edit, a model update, or a prompt wording change can all shift what tools Claude calls and what it says — unit tests won't catch that, evals will.
 
@@ -19,7 +19,7 @@ async def run_test_flow(user_request, skill_names) -> tuple[str, list[str]]:
     # runs the full agentic loop, returns (response_text, tools_called)
 ```
 
-Runs a real flow — opens an MCP session, calls Bedrock, executes tool calls — and returns what Claude said and which tools it called. Each test calls this and asserts against the results.
+Runs a real flow — opens an MCP session, calls the model, executes tool calls — and returns what Claude said and which tools it called. Each test calls this and asserts against the results.
 
 ### Four assertion types
 
@@ -170,7 +170,7 @@ async def llm_judge(response: str, rubric: str) -> dict:
 
 Example rubric for a risk assessment: *"The response must identify Eve Contractor as high or critical risk, cite no-MFA and external IPs as evidence, and recommend immediate action. The score must be justified by specific data points, not asserted."*
 
-**Trade-off:** Each eval now costs two Bedrock calls. But it catches failures that keyword matching misses entirely.
+**Trade-off:** Each eval now costs two model calls. But it catches failures that keyword matching misses entirely.
 
 ---
 

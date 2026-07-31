@@ -4,14 +4,14 @@
 
 MCP is a protocol that lets Claude call functions on a running server rather than executing code directly. The MCP server exposes a set of tools — Claude calls them by name with arguments, the server executes the real logic, and returns a result. Claude never touches the database directly.
 
-In this project MCP serves as the boundary between Claude's reasoning and the SQLite database. All reads and writes go through the MCP server, which means tool logic lives in one place and can be used by both the Bedrock flows and Claude Desktop without duplication.
+In this project MCP serves as the boundary between Claude's reasoning and the SQLite database. All reads and writes go through the MCP server, which means tool logic lives in one place and can be used by both the Python flows and Claude Desktop without duplication.
 
 ---
 
 ## Architecture
 
 ```
-Claude (via Bedrock)
+Claude (via Bedrock or the Anthropic API)
     │
     │  tool_use block: {name: "get_user", input: {user_id: "usr_005"}}
     ▼
@@ -70,7 +70,7 @@ FastMCP uses:
 
 ### Prompt registration
 
-Skills are also exposed as prompts via `@mcp.prompt()`. These appear in Claude Desktop's prompt picker and load the same `SKILL.md` files that the Bedrock flows use:
+Skills are also exposed as prompts via `@mcp.prompt()`. These appear in Claude Desktop's prompt picker and load the same `SKILL.md` files that the Python flows use:
 
 ```python
 @mcp.prompt()
@@ -207,7 +207,7 @@ In the reflection flow (`run_flow_with_reflection`), **one session spans all thr
 
 ## How the orchestrator discovers tools
 
-The Bedrock flows do **not** query the MCP session for its tool list at runtime. Instead, `USER_TOOLS` in `tools.py` is a static declaration that Claude receives in every `client.messages.create` call. The MCP session is used only to **execute** tool calls that Claude decides to make based on those schemas.
+The Python flows do **not** query the MCP session for its tool list at runtime. Instead, `USER_TOOLS` in `tools.py` is a static declaration that Claude receives in every `client.messages.create` call. The MCP session is used only to **execute** tool calls that Claude decides to make based on those schemas.
 
 The flow is:
 1. Claude receives `USER_TOOLS` schemas → decides which tools to call
@@ -215,13 +215,13 @@ The flow is:
 3. MCP server executes the real Python function
 4. Result returned as JSON string → appended to `msgs` as a tool result
 
-The MCP server's own schema (from `@mcp.tool()` docstrings) is used by Claude Desktop and for the MCP protocol handshake — not by the Bedrock flow. This means the two schema definitions must be kept in sync manually.
+The MCP server's own schema (from `@mcp.tool()` docstrings) is used by Claude Desktop and for the MCP protocol handshake — not by the Python flows. This means the two schema definitions must be kept in sync manually.
 
 ---
 
 ## Limitations
 
-**Two schema definitions must stay in sync.** `USER_TOOLS` in `tools.py` and `@mcp.tool()` docstrings in `server.py` describe the same tools in two different formats. A description update or parameter change in one place that's missed in the other means Claude Desktop and the Bedrock flow get different guidance.
+**Two schema definitions must stay in sync.** `USER_TOOLS` in `tools.py` and `@mcp.tool()` docstrings in `server.py` describe the same tools in two different formats. A description update or parameter change in one place that's missed in the other means Claude Desktop and the Python flows get different guidance.
 
 **Session-per-round overhead.** The convergence loop opens and closes an MCP session for every round to avoid the HTTP connection timeout issue. Each session open involves a subprocess spawn (stdio) or HTTP handshake (HTTP mode), adding latency.
 
@@ -233,7 +233,7 @@ The MCP server's own schema (from `@mcp.tool()` docstrings) is used by Claude De
 
 ### 1. Dynamic tool discovery
 
-**Problem:** `USER_TOOLS` and `@mcp.tool()` must be kept in sync manually. A mismatch silently gives Claude Desktop and the Bedrock flow different tool descriptions.
+**Problem:** `USER_TOOLS` and `@mcp.tool()` must be kept in sync manually. A mismatch silently gives Claude Desktop and the Python flows different tool descriptions.
 
 **How it works:** Query the MCP session for its tool list after `initialize()` and build the Anthropic schema dynamically:
 
@@ -250,7 +250,7 @@ async def get_user_tools(session: ClientSession) -> list[dict]:
     ]
 ```
 
-`USER_TOOLS` in `tools.py` is removed. The tool list is fetched once per flow from the MCP server — the single source of truth is `server.py` docstrings. Prompt caching of the tool list would still apply (cache after fetching, before the first Bedrock call).
+`USER_TOOLS` in `tools.py` is removed. The tool list is fetched once per flow from the MCP server — the single source of truth is `server.py` docstrings. Prompt caching of the tool list would still apply (cache after fetching, before the first model call).
 
 ---
 

@@ -39,7 +39,7 @@ When `verbose=True`, the loop now uses `client.messages.stream()` instead of `cl
 ```python
 if verbose:
     async with client.messages.stream(
-        model      = BEDROCK_MODEL_ID,
+        model      = MODEL_ID,
         max_tokens = 4096,
         system     = cached_system,
         tools      = cached_tools,
@@ -77,11 +77,11 @@ Three new async generator functions — one per flow pattern — for the orchest
 
 **Key design:** text is yielded immediately inside the `async with start_mcp_session()` context, token by token as Claude generates it. The session stays open during streaming and only closes after tool calls complete — never across a yield between rounds or phases. This keeps the anyio TaskGroup scoped to a single round/phase and prevents it from leaking into the event loop state between requests.
 
-> **Bug fixed:** the initial implementation buffered all text inside the session and yielded it as a batch after the session closed. This caused text to appear all at once per Bedrock call rather than token by token — effectively defeating streaming. The fix was to yield inside the session, which is safe because each round/phase opens its own fresh session.
+> **Bug fixed:** the initial implementation buffered all text inside the session and yielded it as a batch after the session closed. This caused text to appear all at once per model call rather than token by token — effectively defeating streaming. The fix was to yield inside the session, which is safe because each round/phase opens its own fresh session.
 
 ### `run_flow_stream` — single shot
 
-One fresh MCP session per Bedrock call. Yields text tokens while the session is open; session closes after tool calls execute.
+One fresh MCP session per model call. Yields text tokens while the session is open; session closes after tool calls execute.
 
 ```python
 while True:

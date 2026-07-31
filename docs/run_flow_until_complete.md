@@ -52,7 +52,7 @@ async def run_flow_until_complete(
 
 ## The two LLM calls per round
 
-Each round involves **two separate calls to Bedrock** — they serve completely different purposes:
+Each round involves **two separate model calls** — they serve completely different purposes:
 
 | Call | Function | Role | Output |
 |---|---|---|---|

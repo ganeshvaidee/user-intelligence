@@ -41,7 +41,7 @@ USER_TOOLS = [
 
 **Layer 2 — What actually runs (`mcp-server/server.py`):**
 
-FastMCP `@mcp.tool()` decorators register the real Python functions. FastMCP derives its own JSON schema from the function signature and docstring for the MCP protocol. Claude Desktop uses this schema; the Bedrock flow uses `USER_TOOLS`.
+FastMCP `@mcp.tool()` decorators register the real Python functions. FastMCP derives its own JSON schema from the function signature and docstring for the MCP protocol. Claude Desktop uses this schema; the Python flows use `USER_TOOLS`.
 
 ```python
 @mcp.tool()
@@ -219,7 +219,7 @@ Validation errors surface immediately at the tool boundary rather than causing s
 
 ### 3. Tool descriptions as the authoritative source
 
-**Problem:** Tool descriptions exist in two places (`USER_TOOLS` in `tools.py` and docstrings in `server.py`) and must be kept in sync manually. A description update in one place that's missed in the other means Claude Desktop and the Bedrock flow get different guidance.
+**Problem:** Tool descriptions exist in two places (`USER_TOOLS` in `tools.py` and docstrings in `server.py`) and must be kept in sync manually. A description update in one place that's missed in the other means Claude Desktop and the Python flows get different guidance.
 
 **How it works:** Make `server.py` the single source of truth. At startup, query the MCP server for its tool list via `session.list_tools()` and build `USER_TOOLS` dynamically from what the server returns — no separate `USER_TOOLS` definition needed.
 

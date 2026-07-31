@@ -2,7 +2,7 @@
 
 ## What it is
 
-Every call to `client.messages.create` receives the full conversation history in the `messages` parameter. Claude sees not just the current question but every tool it has called, every result it received, and everything it has said so far. This is what makes the agentic loop work — Claude can reason over accumulated data rather than starting from scratch on each Bedrock call.
+Every call to `client.messages.create` receives the full conversation history in the `messages` parameter. Claude sees not just the current question but every tool it has called, every result it received, and everything it has said so far. This is what makes the agentic loop work — Claude can reason over accumulated data rather than starting from scratch on each model call.
 
 Multi-turn conversation is not a separate feature that gets "enabled" — it is the natural result of maintaining and growing the `msgs` list across loop iterations.
 
@@ -18,7 +18,7 @@ The conversation starts with the user's request:
 messages = [{"role": "user", "content": user_request}]
 ```
 
-After each Bedrock call, the assistant's turn is appended — including any tool call blocks:
+After each model call, the assistant's turn is appended — including any tool call blocks:
 
 ```python
 msgs.append({"role": "assistant", "content": response.content})
@@ -30,7 +30,7 @@ After tool results are collected, they are appended as a user turn:
 msgs.append({"role": "user", "content": tool_results})
 ```
 
-The loop then calls Bedrock again with the grown `msgs` list. Claude sees the full history every time.
+The loop then calls the model again with the grown `msgs` list. Claude sees the full history every time.
 
 ---
 
@@ -44,7 +44,7 @@ The loop then calls Bedrock again with the grown `msgs` list. Claude sees the fu
 ]
 ```
 
-### After Bedrock call 1 — Claude calls `get_user`
+### After model call 1 — Claude calls `get_user`
 
 ```python
 [
@@ -59,7 +59,7 @@ The loop then calls Bedrock again with the grown `msgs` list. Claude sees the fu
 ]
 ```
 
-### After Bedrock call 2 — Claude calls `get_user_activity` + `get_user_permissions`
+### After model call 2 — Claude calls `get_user_activity` + `get_user_permissions`
 
 ```python
 [
@@ -75,7 +75,7 @@ The loop then calls Bedrock again with the grown `msgs` list. Claude sees the fu
 ]
 ```
 
-### After Bedrock call 3 — Claude writes its final answer (`stop_reason == "end_turn"`)
+### After model call 3 — Claude writes its final answer (`stop_reason == "end_turn"`)
 
 ```python
 [
@@ -158,7 +158,7 @@ The `tool_use_id` is how Claude maps results back to the calls it made. If multi
 
 ### Context window growth
 
-`msgs` grows with every tool call and every result. The Bedrock Claude Sonnet model supports a 200K token context window, but a long convergence loop with large tool results (e.g., 100 activity events) could approach that limit. There's no check on message size before calling Bedrock — the error from a context overflow would be an unhelpful API error.
+`msgs` grows with every tool call and every result. Sonnet 4.6 supports a 1M token context window — the same on Bedrock and the direct Anthropic API — but a long convergence loop with large tool results (e.g., 100 activity events) could approach that limit. There's no check on message size before the model call — the error from a context overflow would be an unhelpful API error.
 
 Estimated token cost per round:
 - `get_user` result: ~100 tokens
@@ -174,7 +174,7 @@ Each call to `run_flow*` starts a fresh `messages` list. There is no memory of p
 
 ### Old tool results stay in context
 
-Once a tool result is in `msgs`, it stays there for all subsequent Bedrock calls in that flow. In a long convergence loop, early tool results that are no longer relevant still consume context tokens and can influence Claude's reasoning. There's no mechanism to prune or summarise old turns.
+Once a tool result is in `msgs`, it stays there for all subsequent model calls in that flow. In a long convergence loop, early tool results that are no longer relevant still consume context tokens and can influence Claude's reasoning. There's no mechanism to prune or summarise old turns.
 
 ---
 
@@ -182,15 +182,15 @@ Once a tool result is in `msgs`, it stays there for all subsequent Bedrock calls
 
 ### 1. Context window monitoring
 
-**Problem:** No check exists on message size before calling Bedrock. A context overflow produces an unhelpful API error with no graceful handling.
+**Problem:** No check exists on message size before the model call. A context overflow produces an unhelpful API error with no graceful handling.
 
-**How it works:** Estimate token count before each Bedrock call and warn — or truncate old tool results — if approaching the limit:
+**How it works:** Estimate token count before each model call and warn — or truncate old tool results — if approaching the limit:
 
 ```python
 def _estimate_tokens(msgs: list[dict]) -> int:
     return len(json.dumps(msgs)) // 4   # rough: 1 token ≈ 4 chars
 
-MAX_CONTEXT_TOKENS = 150_000   # warn at 75% of 200K limit
+MAX_CONTEXT_TOKENS = 800_000   # warn at 80% of the 1M limit
 
 if _estimate_tokens(msgs) > MAX_CONTEXT_TOKENS:
     print(f"[WARNING] Context at ~{_estimate_tokens(msgs):,} tokens — approaching limit")

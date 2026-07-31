@@ -114,7 +114,7 @@ async def run_dimension_agent(dimension: str, user_id: str) -> dict:
     async with start_mcp_session() as session:
         while True:
             response = await client.messages.create(
-                model=BEDROCK_MODEL_ID, max_tokens=2048,
+                model=MODEL_ID, max_tokens=2048,
                 system=cached_system, tools=cached_tools, messages=messages,
             )
             tool_results = []
@@ -175,7 +175,7 @@ Note: `run_flow_parallel_risk` takes `user_id` directly (not a free-text `user_r
 | | Serial (`run_flow` + `user-risk-profile`) | Parallel (`run_flow_parallel_risk`) |
 |---|---|---|
 | Claude instances | 1 | 4 |
-| Bedrock calls | 3–5 (multi-round tool loop) | 4 (one per agent, concurrent) |
+| Model calls | 3–5 (multi-round tool loop) | 4 (one per agent, concurrent) |
 | MCP sessions | 1 | 4 (concurrent) |
 | Wall-clock time | Sum of all rounds | ≈ slowest single agent |
 | Score basis | One conversation with all data | Four independent assessments |

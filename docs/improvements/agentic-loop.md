@@ -2,7 +2,7 @@
 
 ## What it is
 
-The agentic loop is the core execution pattern of this project. Instead of Claude answering a question in a single call, it runs in a conversation cycle — calling Bedrock, executing whatever tools Claude requests, feeding the results back, and repeating — until Claude decides it has enough information to write its final answer.
+The agentic loop is the core execution pattern of this project. Instead of Claude answering a question in a single call, it runs in a conversation cycle — calling the model, executing whatever tools Claude requests, feeding the results back, and repeating — until Claude decides it has enough information to write its final answer.
 
 Claude drives the loop entirely. The Python code only dispatches tool calls and feeds results back. It has no logic for which tools to call, in what order, or when to stop — all of that is Claude's decision.
 
@@ -25,7 +25,7 @@ async def _run_tool_loop(
 ### What it does step by step
 
 ```
-1. Call Bedrock with current messages + tools + system prompt
+1. Call the model with current messages + tools + system prompt
 2. For each block in the response:
      - TextBlock  → accumulate text
      - ToolUseBlock → execute tool via MCP → collect result
@@ -42,17 +42,17 @@ Each pass through the loop adds two turns to `msgs`:
 Initial:
   [{role: user, content: "Give me a risk assessment for usr_005"}]
 
-After Bedrock call 1 (Claude calls get_user):
+After model call 1 (Claude calls get_user):
   [{role: user,      content: "Give me a risk assessment..."},
    {role: assistant, content: [ToolUseBlock(get_user, {user_id: usr_005})]},
    {role: user,      content: [tool_result: {name: Eve, status: active, mfa: false...}]}]
 
-After Bedrock call 2 (Claude calls get_user_activity + get_user_permissions):
+After model call 2 (Claude calls get_user_activity + get_user_permissions):
   [...same as above...,
    {role: assistant, content: [ToolUseBlock(get_user_activity), ToolUseBlock(get_user_permissions)]},
    {role: user,      content: [tool_result: {...activity...}, tool_result: {...permissions...}]}]
 
-After Bedrock call 3 (Claude writes final answer, stop_reason = end_turn):
+After model call 3 (Claude writes final answer, stop_reason = end_turn):
   [...same...,
    {role: assistant, content: [TextBlock("## Risk Assessment — Eve Contractor...")]}]
    ← loop breaks here
@@ -62,7 +62,7 @@ By the time Claude writes its final answer, it can see every tool it called, eve
 
 ### Multiple tools in one call
 
-Claude can return multiple `ToolUseBlock`s in a single response when it decides it needs several things and they don't depend on each other. The loop collects all results before making the next Bedrock call:
+Claude can return multiple `ToolUseBlock`s in a single response when it decides it needs several things and they don't depend on each other. The loop collects all results before making the next model call:
 
 ```python
 tool_results = []
@@ -167,7 +167,7 @@ Key design decisions:
 
 **Tool calls are serial within a round.** Even when Claude returns multiple `ToolUseBlock`s in one response, `execute_tool` is called sequentially in a `for` loop. For two independent calls like `get_user_activity` and `get_user_permissions`, there's no reason they can't run concurrently.
 
-**No max_tokens guard.** `msgs` grows unboundedly. A very long flow could approach the model's context window limit, causing a Bedrock error. There's no check on message list size before calling.
+**No max_tokens guard.** `msgs` grows unboundedly. A very long flow could approach the model's context window limit, causing an API error. There's no check on message list size before calling.
 
 **`stop_reason` is the only signal.** The loop trusts Claude to stop. There's no secondary check — e.g., if Claude loops on `tool_use` without making progress, the code won't detect it.
 
@@ -204,7 +204,7 @@ The results are then appended in the same order as the `tool_use` blocks so the 
 
 ### 2. Max iterations guard
 
-**Problem:** No circuit breaker exists. A runaway loop (Claude repeatedly calling tools without reaching `end_turn`) would run until Bedrock returns an error or the process is killed.
+**Problem:** No circuit breaker exists. A runaway loop (Claude repeatedly calling tools without reaching `end_turn`) would run until the API returns an error or the process is killed.
 
 **How it works:** Add a `max_iterations` parameter with a sensible default:
 
@@ -219,15 +219,15 @@ async def _run_tool_loop(..., max_iterations: int = 20):
         ...
 ```
 
-20 iterations is generous — a typical risk assessment uses 3–5 Bedrock calls. Hitting 20 is a signal something is wrong, not a normal operating condition.
+20 iterations is generous — a typical risk assessment uses 3–5 model calls. Hitting 20 is a signal something is wrong, not a normal operating condition.
 
 ---
 
 ### 3. Context window guard
 
-**Problem:** `msgs` grows with every tool call and every result. For large activity logs or many rounds in the convergence loop, the message list could approach the model's context limit (200K tokens for Claude Sonnet), causing a Bedrock error with no graceful handling.
+**Problem:** `msgs` grows with every tool call and every result. For large activity logs or many rounds in the convergence loop, the message list could approach the model's context limit (1M tokens for Sonnet 4.6, on either provider), causing an API error with no graceful handling.
 
-**How it works:** Estimate token count before each Bedrock call and warn (or truncate old tool results) if approaching the limit:
+**How it works:** Estimate token count before each model call and warn (or truncate old tool results) if approaching the limit:
 
 ```python
 import json
@@ -236,7 +236,7 @@ def _estimate_tokens(msgs: list[dict]) -> int:
     # rough estimate: 1 token ≈ 4 chars
     return len(json.dumps(msgs)) // 4
 
-MAX_TOKENS_BEFORE_WARN = 150_000
+MAX_TOKENS_BEFORE_WARN = 800_000   # ~80% of the 1M context window
 
 if _estimate_tokens(msgs) > MAX_TOKENS_BEFORE_WARN:
     print(f"[WARNING] Conversation approaching context limit — consider truncating old tool results")

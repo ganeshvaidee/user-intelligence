@@ -6,7 +6,7 @@ Every call to `client.messages.create` sends the full system prompt (skills cont
 
 ## Solution
 
-Mark static content with `cache_control: {type: ephemeral}` so Bedrock processes it once and serves subsequent calls from cache at ~90% lower token cost. Caching is transparent — it has no effect on Claude's output, only on cost and speed.
+Mark static content with `cache_control: {type: ephemeral}` so the API processes it once and serves subsequent calls from cache at ~90% lower token cost. Caching is transparent — it has no effect on Claude's output, only on cost and speed. It works identically on Bedrock and the direct Anthropic API; nothing in the request shape changes between providers.
 
 ## What gets cached
 
@@ -47,7 +47,7 @@ Convert `system` from a string to a cached content block. Build a cached copy of
 ```python
 # Before
 response = await client.messages.create(
-    model      = BEDROCK_MODEL_ID,
+    model      = MODEL_ID,
     max_tokens = 4096,
     system     = system_prompt,
     tools      = USER_TOOLS,
@@ -57,7 +57,7 @@ response = await client.messages.create(
 # After
 cached_tools = [{**tool, "cache_control": {"type": "ephemeral"}} for tool in USER_TOOLS]
 response = await client.messages.create(
-    model      = BEDROCK_MODEL_ID,
+    model      = MODEL_ID,
     max_tokens = 4096,
     system     = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
     tools      = cached_tools,
@@ -97,5 +97,15 @@ Phase 3 (revision): → cache hit ✓  (same system prompt, same MCP session)
 ## Verification
 
 1. Run option 5 (convergence loop, usr_005) — most rounds = most cache hits
-2. Check AWS Bedrock console → Model invocations → look for `cache_read_input_tokens > 0` on Round 2+
+2. Read the usage fields off the response object — this works on both providers and needs no console access:
+
+   ```python
+   print(response.usage.cache_creation_input_tokens)  # tokens written to cache (~1.25x cost)
+   print(response.usage.cache_read_input_tokens)      # tokens served from cache (~0.1x cost)
+   print(response.usage.input_tokens)                 # uncached tokens (full cost)
+   ```
+
+   Expect `cache_creation_input_tokens > 0` on the first call and `cache_read_input_tokens > 0` on Round 2+. If `cache_read_input_tokens` stays at zero across rounds, something is invalidating the prefix — a changed tool list, a different model ID, or dynamic content in the system prompt.
+
+   On Bedrock, the same numbers are also visible in the AWS console under Model invocations. There is no equivalent console view on the direct Anthropic API — read them off the response.
 3. Run `python tests/test_flows.py` — all 8 tests should pass unchanged (caching is transparent to output)

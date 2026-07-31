@@ -597,8 +597,8 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
     """
     Run one dimension scoring agent. Opens its own MCP session, fetches data,
     scores its dimension, and returns a structured result via report_dimension_score.
-    When thinking=True, extended thinking is enabled — Claude reasons step-by-step
-    before scoring, making the logic auditable.
+    When thinking=True, adaptive thinking is enabled — Claude reasons step-by-step
+    before scoring, and returns a summary of that reasoning, making the logic auditable.
     """
     system_prompt = _build_system_prompt(load_skill(f"risk-{dimension}"))
     messages      = [{"role": "user", "content": f"Score the {dimension} risk dimension for user {user_id}."}]
@@ -619,7 +619,12 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
                 messages   = messages,
             )
             if thinking:
-                create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+                # Adaptive thinking — Claude picks the depth per request instead of
+                # spending a fixed budget. display="summarized" is required: the
+                # default is "omitted", which returns thinking blocks with empty text
+                # and would silently break the [THINKING — ...] audit output below.
+                create_kwargs["thinking"]      = {"type": "adaptive", "display": "summarized"}
+                create_kwargs["output_config"] = {"effort": "high"}
 
             response = await client.messages.create(**create_kwargs)
 

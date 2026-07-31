@@ -2,7 +2,7 @@
 
 > **Scope: Option 7 only.**
 > Extended Thinking is enabled exclusively in `run_dimension_agent` (`flows/run_flow.py`), which is called only by `run_flow_parallel_risk` (option 7 — "Risk assessment (parallel agents + extended thinking)").
-> Options 1–6 use standard Bedrock calls with no thinking parameter.
+> Options 1–6 use standard model calls with no thinking parameter.
 
 ---
 
@@ -12,34 +12,55 @@ The parallel dimension agents score risk correctly but implicitly. Claude reads 
 
 ## Solution
 
-Extended Thinking adds a `thinking` parameter to the Bedrock call. Claude reasons through the scoring conditions step by step *before* committing to a score. The thinking is returned as a `ThinkingBlock` alongside the tool call — auditable, logged in verbose mode, and summarised in the report via the `reasoning` field.
+Adaptive thinking adds a `thinking` parameter to the model call. Claude reasons through the scoring conditions step by step *before* committing to a score. The reasoning is returned as a `ThinkingBlock` alongside the tool call — auditable, logged in verbose mode, and summarised in the report via the `reasoning` field.
 
 ---
 
 ## Where it lives
 
-**One function:** `run_dimension_agent(dimension, user_id, verbose)` in `flows/run_flow.py`.
+**One function:** `run_dimension_agent(dimension, user_id, verbose, thinking)` in `flows/run_flow.py`.
 
-This function is called four times concurrently by `run_flow_parallel_risk` via `asyncio.gather`. Each call gets its own thinking budget.
+This function is called four times concurrently by `run_flow_parallel_risk` via `asyncio.gather`. Each call decides its own thinking depth independently.
 
 ---
 
 ## Implementation
 
-### Bedrock call
+### The model call
 
 ```python
 response = await client.messages.create(
-    model      = BEDROCK_MODEL_ID,   # us.anthropic.claude-sonnet-4-6
-    max_tokens = 10000,              # must exceed budget_tokens
-    thinking   = {"type": "enabled", "budget_tokens": 8000},
-    system     = cached_system,
-    tools      = cached_tools,
-    messages   = messages,
+    model         = MODEL_ID,           # provider-dependent — see below
+    max_tokens    = 10000,
+    thinking      = {"type": "adaptive", "display": "summarized"},
+    output_config = {"effort": "high"},
+    system        = cached_system,
+    tools         = cached_tools,
+    messages      = messages,
 )
 ```
 
-`budget_tokens` is the maximum tokens Claude can spend thinking. `max_tokens` must be strictly greater than `budget_tokens` to leave room for the actual response.
+Three parameters do the work:
+
+| Parameter | Why |
+|---|---|
+| `thinking={"type": "adaptive"}` | Claude decides how much to think per request rather than spending a fixed budget. A cheap dimension like `account` (two fields) stops early; `behaviour` can reason longer when the data warrants it. |
+| `display="summarized"` | **Required, not cosmetic.** The default is `"omitted"`, which returns thinking blocks whose `.thinking` field is an empty string. Without this the `[THINKING — …]` audit output below prints blank blocks — no error, just silently no reasoning to audit. |
+| `output_config={"effort": "high"}` | Controls thinking depth and overall token spend. This is the successor to the old fixed-budget knob. |
+
+`MODEL_ID` comes from `flows/llm_client.py`, which resolves it per provider — `us.anthropic.claude-sonnet-4-6` on Bedrock (an inference-profile ID, overridable with `BEDROCK_MODEL_ID`), `claude-sonnet-4-6` on the direct Anthropic API (overridable with `ANTHROPIC_MODEL_ID`). All three thinking parameters behave identically on both.
+
+### Why not `budget_tokens`
+
+This code previously used the fixed-budget form:
+
+```python
+thinking = {"type": "enabled", "budget_tokens": 8000}   # no longer used
+```
+
+That form is **deprecated on Sonnet 4.6 and rejected with a 400 on newer models** (Opus 4.7 and later, Sonnet 5, Fable 5). Since `BEDROCK_MODEL_ID` / `ANTHROPIC_MODEL_ID` are environment-overridable, pointing this project at a newer model would have failed all four dimension agents at once. Adaptive thinking plus `effort` is the supported replacement and works across every current model.
+
+The tradeoff: there is no longer a hard per-request ceiling on thinking tokens. `max_tokens=10000` remains the enforced cap on the response as a whole (thinking plus output), and `effort` is the tuning knob — drop it to `"medium"` or `"low"` if the four concurrent agents cost more than you want.
 
 ### Handling the ThinkingBlock
 
@@ -90,7 +111,7 @@ When was the last login? Is it more than 90 days ago? → +1 if yes
 Add up the points and verify the total is correct before reporting.
 ```
 
-This steers the thinking budget toward systematic condition-checking rather than narrative prose. Without this guidance, Claude might spend tokens explaining context rather than verifying thresholds.
+This steers the thinking toward systematic condition-checking rather than narrative prose. Without this guidance, Claude might spend tokens explaining context rather than verifying thresholds.
 
 ---
 
@@ -176,10 +197,10 @@ data: {"thinking_end": "auth"}\n\n
 data: {"text": "## Risk Assessment..."}\n\n
 ```
 
-### Tune `budget_tokens` per dimension
+### Tune `effort` per dimension
 
-Currently all four agents get 8000 tokens. The permissions dimension (multiple conditions, write-permission counting with a cap) likely benefits from more budget than the account dimension (only 3 simple conditions). Per-dimension budgets would reduce cost without sacrificing accuracy.
+All four agents currently run at `effort: "high"`. The permissions dimension (multiple conditions, write-permission counting with a cap) plausibly needs more depth than the account dimension (three simple conditions). Passing a per-dimension effort level would cut cost on the cheap dimensions without sacrificing accuracy on the expensive ones — measure first, since adaptive thinking already scales depth to the task and the difference may be smaller than it looks.
 
 ### Extend to convergence and reflection flows
 
-Options 5 and 6 use a single agent for all four dimensions. Adding extended thinking there would make the full risk assessment auditable — but the budget_tokens would need to be larger (the agent reasons about all four dimensions, not just one).
+Options 5 and 6 use a single agent for all four dimensions. Adding thinking there would make the full risk assessment auditable. Adaptive thinking should handle the larger scope on its own — the single agent reasons about all four dimensions, so it will simply think longer — but `max_tokens` would need raising above the current 4096 to leave room for both the reasoning and the response.

@@ -82,7 +82,7 @@ def _build_system_prompt(skills_content: str) -> str:
     )
 ```
 
-The combined string becomes the `system` parameter on every Bedrock call. With prompt caching enabled, this content is processed once and served from cache on subsequent calls within the same flow.
+The combined string becomes the `system` parameter on every model call. With prompt caching enabled, this content is processed once and served from cache on subsequent calls within the same flow.
 
 ---
 
@@ -158,7 +158,7 @@ def risk_assessment() -> str:
     return _load_skills("_base", "lookup-user", "user-risk-profile")
 ```
 
-Selecting a prompt in Claude Desktop before asking a question loads the skill instructions into context — the same content that `load_skill()` injects programmatically in the Bedrock flows.
+Selecting a prompt in Claude Desktop before asking a question loads the skill instructions into context — the same content that `load_skill()` injects programmatically in the Python flows.
 
 ---
 
@@ -168,7 +168,7 @@ Selecting a prompt in Claude Desktop before asking a question loads the skill in
 
 **No validation that skills were followed.** Claude might ignore a skill rule (e.g., skip the confirmation gate if the user request is worded persuasively). Nothing in the Python code enforces skill compliance — only the evals catch this after the fact.
 
-**No skill unit testing.** Skills are only tested end-to-end via `test_flows.py`. There's no way to test a single skill in isolation (e.g., test `user-risk-profile` scoring without running a full Bedrock flow).
+**No skill unit testing.** Skills are only tested end-to-end via `test_flows.py`. There's no way to test a single skill in isolation (e.g., test `user-risk-profile` scoring without running a full end-to-end flow).
 
 **Dependency order is implicit.** The correct loading order is documented in each `SKILL.md` but not enforced in code. Passing skills in the wrong order silently produces a malformed system prompt.
 

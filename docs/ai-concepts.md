@@ -2,7 +2,7 @@
 
 ## TODOs — Concepts to Explore Next (Evals)
 
-- [ ]  **LLM-as-Judge for response quality** — instead of keyword matching (`"MFA" in response`), use a second Claude call to evaluate whether the response is accurate, well-justified, and actionable. More robust than string checks against non-deterministic output.
+- [ ]  **LLM-as-Judge for eval assertions** — the *runtime* judges are built (see Done below and concept 6); this TODO is about the **eval suite**. `tests/test_flows.py` still asserts with string and regex matching (`assert_response_contains`, `extract_risk_score`). Replace those with a second Claude call that evaluates whether the response is accurate, well-justified, and actionable. More robust than string checks against non-deterministic output.
 - [ ]  **Golden dataset** — a fixed set of (request, expected_tools_called, expected_score_range, expected_keywords) tuples that cover all users and all flow types. Currently tests are hand-written per scenario; a dataset makes coverage gaps visible.
 - [ ]  **Consistency evals** — run the same request N times and check that scores and tool call sequences are stable. LLM outputs are non-deterministic; high variance on the same input is a signal the skill instructions are ambiguous.
 
@@ -10,6 +10,7 @@
 
 ## Done
 
+- [X]  **LLM-as-Judge (runtime)** — see concept 6 below and `docs/improvements/llm-as-judge.md`. Completeness judge in option 5, critic judge in option 6, both in blocking and streaming variants. **Not** used in options 1–4 or 7–9. Distinct from the eval-suite judge still open in the TODOs above.
 - [X]  **Prompt Caching** — see concept 8 below and `docs/improvements/prompt-caching.md`.
 - [X]  **Streaming** — see concept 9 below and `docs/improvements/streaming.md`.
 - [X]  **Multi-Agent (Parallel Subagents)** — see concept 10 below and `docs/improvements/multi-agent-parallel.md`.
@@ -27,6 +28,41 @@
 - [ ]  **Batch Processing** — use the Anthropic Batch API to run risk assessments on a list of users (e.g. all contractors) in parallel rather than serially. Useful for bulk audits.
 - [x]  **Human-in-the-Loop (Interrupts)** — see `docs/improvements/human-in-the-loop.md`. Two-phase offboarding: Phase 1 assesses and flags, client presents summary and waits for human CONFIRM, Phase 2 deactivates.
 - [x]  **Hooks** — see `docs/improvements/hooks.md`.
+
+---
+
+## 0. Model Provider: Bedrock or the Anthropic API
+
+Every concept below runs against a Claude model, and the project can reach that model two ways. `flows/llm_client.py` picks one at **import time** and re-exports a single `client` and `MODEL_ID` that the rest of the codebase uses. No other file knows which provider is active:
+
+```python
+# flows/llm_client.py
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic")
+
+if LLM_PROVIDER == "bedrock":
+    from bedrock_client import client, BEDROCK_MODEL_ID as MODEL_ID
+else:
+    from anthropic_client import client, MODEL_ID
+```
+
+**The default is the direct Anthropic API** — Bedrock is opt-in via `LLM_PROVIDER=bedrock`.
+
+|  | Direct Anthropic API (default) | AWS Bedrock |
+|---|---|---|
+| Selected by | `LLM_PROVIDER` unset or any value other than `bedrock` | `LLM_PROVIDER=bedrock` |
+| Client module | `flows/anthropic_client.py` | `flows/bedrock_client.py` |
+| SDK class | `anthropic.AsyncAnthropic()` | `anthropic.AsyncAnthropicBedrock(...)` |
+| Auth | `ANTHROPIC_API_KEY`, or an `ant auth login` profile | AWS credentials from the `default` boto3 profile (access key, secret, session token) |
+| Region | n/a | `us-west-2`, set in `bedrock_client.py` |
+| Default model ID | `claude-sonnet-4-6` | `us.anthropic.claude-sonnet-4-6` (a cross-region inference profile) |
+| Model override | `ANTHROPIC_MODEL_ID` | `BEDROCK_MODEL_ID` |
+| Extra dependency | none | `boto3` |
+
+The model IDs differ in form: Bedrock inference-profile IDs carry a `us.` region prefix and an `anthropic.` vendor prefix, while the direct API takes the bare model name. This is why code samples in these docs say `MODEL_ID` rather than either literal — `llm_client.py` resolves it.
+
+**What does *not* change between providers:** the Messages API request and response shape, tool schemas, `tool_choice`, prompt caching (`cache_control`), extended thinking, streaming, and the `usage` fields. Every concept documented below works identically on both. The only provider-specific things in this project are client construction, credentials, and the model-ID string.
+
+Setup instructions for each provider are in the [README](../README.md#3-model-access).
 
 ---
 
@@ -58,7 +94,7 @@ if tools.index("flag_user") > tools.index("deactivate_user"):
     failures.append("SAFETY VIOLATION: deactivate_user called before flag_user")
 ```
 
-Each test runs a real flow against the real MCP server and real Bedrock — no mocking. This catches the failure mode where mocked tests pass but real Claude behaviour diverges from what the skill intended.
+Each test runs a real flow against the real MCP server and a real model API — no mocking. This catches the failure mode where mocked tests pass but real Claude behaviour diverges from what the skill intended.
 
 Tests cover: lookup by ID, lookup by email, MFA warning surfacing, high-risk scoring, low-risk scoring, confirmation gate enforcement, inactive user handling, and the flag-before-deactivate safety rule.
 
@@ -68,7 +104,7 @@ Tests cover: lookup by ID, lookup by email, MFA warning surfacing, high-risk sco
 
 Claude is given a list of tool schemas (`USER_TOOLS`) and decides which to call, with what arguments, and in what order. The core Claude capability — instead of answering from training data, it calls real functions to get live data.
 
-The tools are defined twice: as FastMCP `@mcp.tool()` decorators (for the MCP protocol) and as Anthropic JSON schemas (for the Bedrock API call). Claude sees the JSON schemas; the MCP server executes the actual Python.
+The tools are defined twice: as FastMCP `@mcp.tool()` decorators (for the MCP protocol) and as Anthropic JSON schemas (for the model API call). Claude sees the JSON schemas; the MCP server executes the actual Python.
 
 ```python
 # What Claude sees (flows/tools.py)
@@ -91,11 +127,11 @@ def get_user(user_id: str) -> dict:
 
 ## 3. Agentic Loop
 
-Claude doesn't answer in one shot. It runs in a loop — call Bedrock, execute tools, feed results back, call Bedrock again — until it decides it has enough information (`stop_reason == "end_turn"`). Claude drives the loop; the code just dispatches whatever Claude returns.
+Claude doesn't answer in one shot. It runs in a loop — call the model, execute tools, feed results back, call the model again — until it decides it has enough information (`stop_reason == "end_turn"`). Claude drives the loop; the code just dispatches whatever Claude returns.
 
 ```
 while True:
-    response = call Bedrock(messages, tools)
+    response = call model(messages, tools)
 
     for block in response:
         if tool_use → execute tool → collect result
@@ -163,10 +199,12 @@ The client switches transport based on the `MCP_URL` environment variable — if
 Two separate LLM calls act as judges — not to answer the user, but to evaluate Claude's own output:
 
 
-| Judge        | Function                | Question it answers                                        |
-| ------------ | ----------------------- | ---------------------------------------------------------- |
-| Completeness | `_check_completeness()` | "Did the response cover everything the request asked for?" |
-| Critic       | `_critique_response()`  | "Are there errors, unjustified claims, or gaps?"           |
+| Judge        | Function                | Option | Question it answers                                        |
+| ------------ | ----------------------- | ------ | ---------------------------------------------------------- |
+| Completeness | `_check_completeness()` | 5      | "Did the response cover everything the request asked for?" |
+| Critic       | `_critique_response()`  | 6      | "Are there errors, unjustified claims, or gaps?"           |
+
+Each judge is called from two places — the blocking flow (`run_flow_until_complete`, `run_flow_with_reflection`) and its streaming twin (`..._stream`). The streaming variants are what `/flow/stream` uses, so those are the judge calls that run in three-service mode. Judge calls are never streamed to the client; they run silently between rounds.
 
 Both use `tool_choice={"type": "any"}` to force structured output instead of prose. This is a key pattern — the judge is forced to call a tool so the result is always a parseable dict, with no fragile string extraction:
 
@@ -179,6 +217,8 @@ result = await client.messages.create(
 # always returns: {"complete": bool, "missing": [...]}
 return next(b for b in result.content if b.type == "tool_use").input
 ```
+
+See `docs/improvements/llm-as-judge.md` for the full design, including the two known limitations: judges see only the response text (not the raw tool results), and the unguarded `next()` above raises `StopIteration` if the judge ever returns no tool block.
 
 ---
 
@@ -204,9 +244,9 @@ In the convergence loop, conversation state accumulates across multiple rounds �
 
 ## 8. Prompt Caching
 
-Every call to `client.messages.create` sends the full system prompt (skills content) and the full `USER_TOOLS` list. In a 3-round convergence flow, the same ~3KB of skills text and ~2KB of tool schemas is processed by the model on every single Bedrock call — wasting tokens and adding latency.
+Every call to `client.messages.create` sends the full system prompt (skills content) and the full `USER_TOOLS` list. In a 3-round convergence flow, the same ~3KB of skills text and ~2KB of tool schemas is processed by the model on every single model call — wasting tokens and adding latency.
 
-Prompt caching marks static content with `cache_control: {type: ephemeral}` so Bedrock processes it once and serves subsequent calls from cache at ~90% lower token cost. The cache lives for 5 minutes — long enough to cover all rounds in a single flow.
+Prompt caching marks static content with `cache_control: {type: ephemeral}` so the API processes it once and serves subsequent calls from cache at ~90% lower token cost. The mechanism and request shape are identical on Bedrock and the direct Anthropic API. The cache lives for 5 minutes — long enough to cover all rounds in a single flow.
 
 ### What is cached
 
@@ -235,7 +275,7 @@ Round 2, Call 1:  system + tools → cache still warm, served from cache ✓
 Round 2, Call 2+: system + tools → served from cache ✓
 ```
 
-In a 3-round convergence flow with 3 Bedrock calls per round, 8 of 9 calls are cache hits on the system prompt and tools — the most expensive tokens in each request.
+In a 3-round convergence flow with 3 model calls per round, 8 of 9 calls are cache hits on the system prompt and tools — the most expensive tokens in each request.
 
 ### Where the changes live
 
@@ -250,7 +290,7 @@ See `docs/improvements/prompt-caching.md` for the full design.
 
 ## 9. Streaming
 
-Before streaming, every Bedrock call blocked until Claude finished the entire response. For a 20–30 second risk assessment the user saw nothing, then received everything at once. Streaming delivers text tokens as Claude generates them.
+Before streaming, every model call blocked until Claude finished the entire response. For a 20–30 second risk assessment the user saw nothing, then received everything at once. Streaming delivers text tokens as Claude generates them.
 
 Two surfaces are implemented:
 
@@ -396,18 +436,21 @@ Total: 6/6.
 
 ### How it works
 
-The `thinking` parameter is added to the Bedrock call in `run_dimension_agent`:
+The `thinking` parameter is added to the model call in `run_dimension_agent`:
 
 ```python
 response = await client.messages.create(
-    model      = BEDROCK_MODEL_ID,
-    max_tokens = 10000,                                  # must exceed budget_tokens
-    thinking   = {"type": "enabled", "budget_tokens": 8000},
-    system     = cached_system,
-    tools      = cached_tools,
-    messages   = messages,
+    model         = MODEL_ID,
+    max_tokens    = 10000,
+    thinking      = {"type": "adaptive", "display": "summarized"},
+    output_config = {"effort": "high"},
+    system        = cached_system,
+    tools         = cached_tools,
+    messages      = messages,
 )
 ```
+
+**Adaptive**, not a fixed budget: Claude decides how deeply to think per request, and `effort` tunes that depth. `display="summarized"` is required — the default is `"omitted"`, which returns thinking blocks with empty text and would silently blank out the `[THINKING — …]` output above. The older `{"type": "enabled", "budget_tokens": N}` form is deprecated on Sonnet 4.6 and rejected outright on newer models; see `docs/improvements/extended-thinking.md` for the migration rationale.
 
 `ThinkingBlock`s in the response are logged in verbose mode and skipped for tool routing — only `tool_use` blocks are dispatched to the MCP server.
 
@@ -427,7 +470,7 @@ response = await client.messages.create(
 
 ### Skill guidance
 
-Each dimension skill file (`skills/risk-{dimension}/SKILL.md`) has a "How to use your thinking" section that instructs Claude to evaluate each condition explicitly with exact numbers before reporting — guiding the thinking budget toward systematic condition-checking rather than free-form prose.
+Each dimension skill file (`skills/risk-{dimension}/SKILL.md`) has a "How to use your thinking" section that instructs Claude to evaluate each condition explicitly with exact numbers before reporting — guiding the thinking toward systematic condition-checking rather than free-form prose.
 
 See `docs/improvements/extended-thinking.md` for the full design.
 
@@ -604,7 +647,7 @@ The client presents 9 options. Each option is NOT a unique skill combination —
 The full power layer. Adds programmatic control that Claude Desktop can't provide:
 
 - **Parallel agents** — `asyncio.gather` across 4 dimension agents simultaneously
-- **Extended thinking** — `budget_tokens` via direct Bedrock API
+- **Extended thinking** — adaptive thinking + `effort` on the model call, not exposed in Claude Desktop
 - **Streaming** — SSE token-by-token delivery to the client
 - **Convergence/reflection** — second LLM judge calls between rounds
 - **Memory/persistence** — prior assessments stored and compared across runs

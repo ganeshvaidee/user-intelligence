@@ -93,7 +93,7 @@ touch .claude/hooks/regression.enabled
 rm .claude/hooks/regression.enabled
 ```
 
-This is useful when making rapid iterative edits to a skill and not wanting to wait for Bedrock calls after each change.
+This is useful when making rapid iterative edits to a skill and not wanting to wait for model calls after each change.
 
 ---
 
