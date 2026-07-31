@@ -164,6 +164,37 @@ async def example_offboard():
 
 ---
 
+## Carrying the order guard across the phase boundary
+
+Splitting the flow in two creates a conflict between the project's own guardrails, and getting this wrong silently disables the whole feature.
+
+`ORDER_REQUIREMENTS["deactivate_user"] == ["flag_user"]`, and the guard checks the `completed` set for **the current conversation**. Phase 2 is a new conversation with an empty set, so `deactivate_user` is blocked — and Claude cannot recover, because tool visibility deliberately hides `flag_user` from the confirm phase. Per-flow tool visibility says *"confirm may only deactivate"*; the order guard says *"you may only deactivate after flagging in this conversation."* Both are individually correct; together they are unsatisfiable, and the symptom is a phase 2 that always leaves the account `flagged` and never `inactive`.
+
+The resolution is to notice that conversation history was only ever a **proxy** for the invariant. What the guard actually protects is *"an audit trail exists before permanent deactivation"* — and `flag_user` records that durably (`UPDATE users SET status = 'flagged'`). So phase 2 checks the real thing:
+
+```python
+async with start_mcp_session() as session:
+    user = json.loads(await execute_tool(session, "get_user", {"user_id": user_id}))
+
+if user.get("status") != "flagged":
+    return f"Refusing to deactivate {user_id}: status is '{user.get('status')}', not 'flagged'."
+
+return await run_flow(
+    ...,
+    skill_names = ["_base", "offboard-confirm"],
+    completed   = {"flag_user"},     # proven by the DB status check above
+)
+```
+
+Two things worth being explicit about:
+
+- **This is stricter than the check it replaces, not a bypass.** The in-conversation guard only proves a `flag_user` call was *made*; the DB check proves the flag *persisted*. An unflagged user is now refused before a single token is spent.
+- **The `get_user` lookup is Python-driven.** `tools_for_skills()` only filters what the *model* sees — `execute_tool()` reaches the MCP server directly, so this does not make `get_user` visible to Claude and `SKILL_TOOLS` is untouched. Same pattern as `get_prior_assessment` in the memory flow.
+
+Regression coverage lives in `tests/test_offboard_hitl.py`, deliberately separate from `tests/test_flows.py`: `run_test_flow()` there reimplements the agentic loop *without* the order guard, so a test written against it would pass whether or not this works — which is exactly how the deadlock went unnoticed.
+
+---
+
 ## Why the client owns the confirmation gate
 
 The client is the human-facing layer — it is the natural place for human interaction. Keeping the gate in the client means:

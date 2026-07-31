@@ -16,18 +16,24 @@
 - [X]  **Multi-Agent (Parallel Subagents)** — see concept 10 below and `docs/improvements/multi-agent-parallel.md`.
 - [X]  **Extended Thinking** — see concept 11 below and `docs/improvements/extended-thinking.md`. **Only used in options 8 and 9 (parallel agents + extended thinking).**
 - [X]  **Memory / Persistence** — see concept 12 below and `docs/improvements/memory-persistence.md`. **Only used in option 9 (parallel + extended thinking + memory).**
-- [x]  **Hooks** — see `docs/improvements/hooks.md`. PostToolUse hook runs the eval suite automatically after any SKILL.md edit.
-- [x]  **Human-in-the-Loop** — see concept 13 below and `docs/improvements/human-in-the-loop.md`. Two-phase offboarding with client-owned confirmation gate.
 - [x]  **Score accuracy evals** — `extract_risk_score` + `assert_score_in_range` in `tests/test_flows.py`. Handles multiple formatting variants (structured template, informal prose, etc.). Single-agent tests use dual-path fallback (score or keyword); parallel agent tests enforce numeric score strictly.
-- [x]  **Regression suite on skill changes** — implemented via Claude Code hooks (`FileChanged` event). Hook runs `tests/test_flows.py --mode single` automatically whenever a SKILL.md file is saved, catching regressions before they ship. See `docs/improvements/hooks.md`.
+- [x]  **Human-in-the-Loop** — see concept 13 below and `docs/improvements/human-in-the-loop.md`. Two-phase offboarding with a client-owned confirmation gate: `prepare` looks up, scores, and flags; the client blocks on `CONFIRM`; `confirm` deactivates. Cross-phase order-guard handling is the load-bearing detail — `run_flow_offboard_confirm()` verifies in the DB that the account is actually `flagged` before seeding `completed={"flag_user"}`, because the guard tracks the *current conversation* and phase 2 is a new one. Regression-tested in `tests/test_offboard_hitl.py` (4/4), which drives the real flows rather than the reimplemented loop in `test_flows.py`.
+
+---
+
+## Built but NOT working — do not mark done
+
+- [ ]  **Hooks** — see `docs/improvements/hooks.md`. **The hook is never invoked.** `.claude/hooks/skill_regression.sh` is written and checked in, but there is no `hooks` block in any settings file — nothing registers it against `PostToolUse` or any other event. The enable-flag `.claude/hooks/regression.enabled` is also absent, so the script would `exit 0` immediately even if it were wired up. (The docs also disagree with themselves on the event name — `PostToolUse` in one place, `FileChanged` in another.) To finish: add a `hooks` block to a checked-in `.claude/settings.json` and create the flag file.
+
+- [ ]  **Regression suite on skill changes** — depends entirely on Hooks above. `tests/test_flows.py --mode single` runs fine manually; nothing runs it automatically on a SKILL.md edit.
 
 ---
 
 ## TODOs — Other Concepts to Explore
 
 - [ ]  **Batch Processing** — use the Anthropic Batch API to run risk assessments on a list of users (e.g. all contractors) in parallel rather than serially. Useful for bulk audits.
-- [x]  **Human-in-the-Loop (Interrupts)** — see `docs/improvements/human-in-the-loop.md`. Two-phase offboarding: Phase 1 assesses and flags, client presents summary and waits for human CONFIRM, Phase 2 deactivates.
-- [x]  **Hooks** — see `docs/improvements/hooks.md`.
+
+> Human-in-the-Loop and Hooks were previously listed here as `[x]` *and* in Done — duplicated. HITL is now genuinely complete (see Done); Hooks is under **Built but NOT working** above.
 
 ---
 

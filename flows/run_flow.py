@@ -173,8 +173,20 @@ async def _run_tool_loop(
 
 # ── Public flow functions ─────────────────────────────────────────
 
-async def run_flow(user_request: str, skill_names: list[str], verbose: bool = True) -> str:
-    """Single-shot: Claude calls tools until it decides it's done."""
+async def run_flow(
+    user_request: str,
+    skill_names: list[str],
+    verbose: bool = True,
+    completed: set[str] | None = None,
+) -> str:
+    """
+    Single-shot: Claude calls tools until it decides it's done.
+
+    `completed` pre-seeds the order guard with tools already known to have
+    succeeded. Normally left as None (nothing has run yet). Pass a seed only
+    when a prerequisite was satisfied outside this conversation and you have
+    verified it — see run_flow_offboard_confirm().
+    """
     system_prompt = _build_system_prompt(load_skill(*skill_names))
     tools = tools_for_skills(skill_names)
 
@@ -188,6 +200,7 @@ async def run_flow(user_request: str, skill_names: list[str], verbose: bool = Tr
             session,
             verbose,
             tools=tools,
+            completed=completed,
         )
     return response_text
 
@@ -944,8 +957,37 @@ async def run_flow_offboard_confirm(user_id: str, reason: str, verbose: bool = T
     """
     Phase 2 of HITL offboarding: deactivate.
     Called only after the human has confirmed in the client.
-    The account is already flagged from Phase 1.
+
+    ORDER_REQUIREMENTS says deactivate_user needs flag_user, but the guard
+    tracks tools completed *in the current conversation* — and this is a new
+    one. Phase 1's flag is recorded durably (flag_user sets status='flagged'),
+    so verify it in the DB and seed the guard from that.
+
+    This is stricter than the in-conversation check, not a way around it: that
+    check only proves a flag_user call was made, while this proves the flag
+    actually persisted. An unflagged user is refused before any model call.
+
+    The get_user lookup is Python-driven — execute_tool() reaches the MCP
+    server directly, so it does not make get_user visible to Claude and
+    SKILL_TOOLS stays untouched. Same pattern as get_prior_assessment.
     """
+    async with start_mcp_session() as session:
+        user = json.loads(await execute_tool(session, "get_user", {"user_id": user_id}))
+
+    if "error" in user:
+        return f"Cannot deactivate {user_id}: {user['error']}"
+    if user.get("status") == "inactive":
+        return f"User {user_id} is already inactive — nothing to do."
+    if user.get("status") != "flagged":
+        return (
+            f"Refusing to deactivate {user_id}: account status is "
+            f"'{user.get('status')}', not 'flagged'. Run the prepare phase first "
+            f"so the flag and its audit trail exist before deactivation."
+        )
+
+    if verbose:
+        print(f"[OFFBOARD] {user_id} confirmed flagged in DB — order guard satisfied.")
+
     return await run_flow(
         user_request = (
             f"Deactivate user {user_id}. Reason: {reason}. "
@@ -953,6 +995,7 @@ async def run_flow_offboard_confirm(user_id: str, reason: str, verbose: bool = T
         ),
         skill_names  = ["_base", "offboard-confirm"],
         verbose      = verbose,
+        completed    = {"flag_user"},   # proven by the DB status check above
     )
 
 
