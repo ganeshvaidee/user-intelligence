@@ -80,6 +80,40 @@ def _print_header(user_request: str, skill_names: list[str]) -> None:
     print(f"{'='*60}\n")
 
 
+# Circuit breaker for the agentic loops. The only real exit condition is
+# Claude returning stop_reason == "end_turn"; if it keeps emitting tool calls
+# the loop has nothing else to stop it. A typical risk assessment uses 3–5
+# iterations, so 20 is generous — hitting it means something is wrong, not that
+# the work was large.
+MAX_TOOL_ITERATIONS = 20
+
+
+def _iteration_guard(iteration: int, where: str) -> bool:
+    """Return True when the loop has exceeded MAX_TOOL_ITERATIONS."""
+    if iteration <= MAX_TOOL_ITERATIONS:
+        return False
+    print(f"[WARNING] {where}: hit MAX_TOOL_ITERATIONS ({MAX_TOOL_ITERATIONS}) "
+          f"— forcing stop. The response may be incomplete.")
+    return True
+
+
+def _is_error_result(result: str) -> bool:
+    """
+    Did an MCP tool report failure?
+
+    Tools return a JSON object and signal failure with an "error" key. Anything
+    that isn't a parseable JSON object — a bare string, a list, plain text from
+    a misbehaving tool — is treated as an error rather than allowed to raise:
+    a json.JSONDecodeError here would kill the whole flow mid-loop, and marking
+    an unrecognisable result as "succeeded" would let it satisfy the order guard.
+    """
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    return not isinstance(parsed, dict) or "error" in parsed
+
+
 async def _dispatch_tool_use(
     session,
     block,
@@ -115,7 +149,7 @@ async def _dispatch_tool_use(
         })
     else:
         result = await execute_tool(session, block.name, block.input)
-        if "error" not in json.loads(result):
+        if not _is_error_result(result):
             completed.add(block.name)
 
     if verbose:
@@ -151,7 +185,11 @@ async def _run_tool_loop(
     cached_tools = _cache_tools(active_tools)
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 
+    iteration = 0
     while True:
+        iteration += 1
+        if _iteration_guard(iteration, "_run_tool_loop"):
+            break
         if verbose:
             async with client.messages.stream(
                 model      = MODEL_ID,
@@ -247,7 +285,11 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
     seen_calls: dict = {}
     completed: set[str] = set()
 
+    iteration = 0
     while True:
+        iteration += 1
+        if _iteration_guard(iteration, "run_flow_stream"):
+            break
         tool_results: list[dict] = []
         stop = False
 
@@ -299,6 +341,7 @@ async def run_flow_until_complete_stream(
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     seen_calls: dict = {}
     completed: set[str] = set()
+    all_text = ""          # accumulates across rounds — what the judge grades
 
     for round_num in range(1, max_rounds + 1):
         round_text = ""
@@ -308,7 +351,11 @@ async def run_flow_until_complete_stream(
         # The session closes after the inner tool-use loop, before the judge call.
         async with start_mcp_session() as session:
             round_messages = list(messages)
+            iteration = 0
             while True:
+                iteration += 1
+                if _iteration_guard(iteration, "run_flow_until_complete_stream"):
+                    break
                 tool_results: list[dict] = []
                 async with client.messages.stream(
                     model      = MODEL_ID,
@@ -338,11 +385,16 @@ async def run_flow_until_complete_stream(
             messages = round_messages
         # Session now closed — judge call runs with no session open
 
+        all_text += round_text
+
         if stop or round_num == max_rounds:
             break
 
         # ── Completeness judge (silent — no streaming) ──
-        check   = await _check_completeness(user_request, round_text)
+        # Judge the accumulated transcript, not just this round. Round 2 only
+        # fills the gaps round 1 left, so judging round_text alone always looks
+        # incomplete and the loop can never converge before max_rounds.
+        check   = await _check_completeness(user_request, all_text)
         missing = check.get("missing") or []
 
         if check.get("judge_unavailable"):
@@ -382,7 +434,11 @@ async def run_flow_with_reflection_stream(
     initial_text = ""
 
     async with start_mcp_session() as session:
+        iteration = 0
         while True:
+            iteration += 1
+            if _iteration_guard(iteration, "run_flow_with_reflection_stream (phase 1)"):
+                break
             tool_results: list[dict] = []
             async with client.messages.stream(
                 model=MODEL_ID, max_tokens=4096,
@@ -428,7 +484,11 @@ async def run_flow_with_reflection_stream(
     })
 
     async with start_mcp_session() as session:
+        iteration = 0          # phase 3 gets its own budget, not phase 1's leftovers
         while True:
+            iteration += 1
+            if _iteration_guard(iteration, "run_flow_with_reflection_stream (phase 3)"):
+                break
             tool_results = []
             async with client.messages.stream(
                 model=MODEL_ID, max_tokens=4096,
@@ -509,10 +569,17 @@ async def run_flow_until_complete(
                       f"stopping with the response UNVERIFIED")
             elif check.get("complete"):
                 print(f"\n[CONVERGENCE] Round {round_num} ✓ complete")
+            elif not missing:
+                print(f"\n[CONVERGENCE] Round {round_num} incomplete but judge named "
+                      f"nothing missing — stopping")
             else:
                 print(f"\n[CONVERGENCE] Round {round_num} incomplete — missing: {missing}")
 
-        if check.get("complete"):
+        # `or not missing` matches run_flow_until_complete_stream. Without it, a
+        # verdict of {"complete": false, "missing": []} sends Claude
+        # "Please also check:" with nothing after the colon — a contentless
+        # instruction that burns a full round, and repeats until max_rounds.
+        if check.get("complete") or not missing:
             break
 
         missing_text = "\n".join(f"- {m}" for m in missing)
@@ -661,7 +728,11 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
     tools_called: list[str] = []
 
     async with start_mcp_session() as session:
+        iteration = 0
         while True:
+            iteration += 1
+            if _iteration_guard(iteration, "run_dimension_agent"):
+                break
             create_kwargs = dict(
                 model      = MODEL_ID,
                 max_tokens = 10000 if thinking else 2048,
@@ -863,11 +934,17 @@ async def run_flow_parallel_risk_with_memory(user_id: str, verbose: bool = True)
     return report
 
 
-async def run_flow_parallel_risk(user_id: str, verbose: bool = True, thinking: bool = False) -> str:
+async def run_flow_parallel_risk(
+    user_id: str, verbose: bool = True, thinking: bool = False
+) -> tuple[str, list[str]]:
     """
     Fan out to 4 independent Claude agents — one per risk dimension.
     thinking=False (default for option 7) — faster, no extended thinking.
     thinking=True  (option 8) — slower, but reasoning is auditable.
+
+    Returns (report, tools_called) — the flat list of tool names across all
+    four agents. Note run_flow_parallel_risk_with_memory() returns the report
+    alone; callers of the two are not interchangeable.
     """
     if verbose:
         label = "PARALLEL RISK ASSESSMENT" + (" + EXTENDED THINKING" if thinking else "")
