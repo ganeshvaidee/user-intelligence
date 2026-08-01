@@ -77,6 +77,7 @@ OR
   python -m venv path/to/venv
   source path/to/venv/bin/activate
   pip install -r mcp-server/requirements.txt
+  pip install -r orchestrator/requirements.txt
 ```
 
 ### 2. Seed the database
