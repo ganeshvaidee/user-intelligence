@@ -50,6 +50,8 @@ Three parameters do the work:
 
 `MODEL_ID` comes from `flows/llm_client.py`, which resolves it per provider — `us.anthropic.claude-sonnet-4-6` on Bedrock (an inference-profile ID, overridable with `BEDROCK_MODEL_ID`), `claude-sonnet-4-6` on the direct Anthropic API (overridable with `ANTHROPIC_MODEL_ID`). All three thinking parameters behave identically on both.
 
+**No `temperature` here — and that's required, not an oversight.** Every other model call in this codebase passes `temperature=TEMPERATURE` (default `0`; see `docs/improvements/temperature-determinism.md`), but the API rejects any value other than `1` when `thinking` is enabled. `run_dimension_agent` builds its `create_kwargs` conditionally: `temperature=TEMPERATURE` is only added in the `else` branch, when `thinking=False`. Setting `thinking=True` and a non-default temperature together is a 400 error, not a silent override.
+
 ### Why not `budget_tokens`
 
 This code previously used the fixed-budget form:

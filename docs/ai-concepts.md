@@ -4,7 +4,7 @@
 
 - [ ]  **LLM-as-Judge for eval assertions** — the *runtime* judges are built (see Done below and concept 6); this TODO is about the **eval suite**. `tests/test_flows.py` still asserts with string and regex matching (`assert_response_contains`, `extract_risk_score`). Replace those with a second Claude call that evaluates whether the response is accurate, well-justified, and actionable. More robust than string checks against non-deterministic output.
 - [ ]  **Golden dataset** — a fixed set of (request, expected_tools_called, expected_score_range, expected_keywords) tuples that cover all users and all flow types. Currently tests are hand-written per scenario; a dataset makes coverage gaps visible.
-- [ ]  **Consistency evals** — run the same request N times and check that scores and tool call sequences are stable. LLM outputs are non-deterministic; high variance on the same input is a signal the skill instructions are ambiguous.
+- [ ]  **Consistency evals** — run the same request N times and check that scores and tool call sequences are stable. LLM outputs are non-deterministic; high variance on the same input is a signal the skill instructions are ambiguous. **Partially addressed** by defaulting `temperature=0` everywhere (see concept 14) — variance should already be much lower — but nothing yet asserts this in CI, so a regression (e.g. someone raising `LLM_TEMPERATURE`) wouldn't be caught.
 
 ---
 
@@ -18,6 +18,7 @@
 - [X]  **Memory / Persistence** — see concept 12 below and `docs/improvements/memory-persistence.md`. **Only used in option 9 (parallel + extended thinking + memory).**
 - [x]  **Score accuracy evals** — `extract_risk_score` + `assert_score_in_range` in `tests/test_flows.py`. Handles multiple formatting variants (structured template, informal prose, etc.). Single-agent tests use dual-path fallback (score or keyword); parallel agent tests enforce numeric score strictly.
 - [x]  **Human-in-the-Loop** — see concept 13 below and `docs/improvements/human-in-the-loop.md`. Two-phase offboarding with a client-owned confirmation gate: `prepare` looks up, scores, and flags; the client blocks on `CONFIRM`; `confirm` deactivates. Cross-phase order-guard handling is the load-bearing detail — `run_flow_offboard_confirm()` verifies in the DB that the account is actually `flagged` before seeding `completed={"flag_user"}`, because the guard tracks the *current conversation* and phase 2 is a new one. Regression-tested in `tests/test_offboard_hitl.py` (4/4), which drives the real flows rather than the reimplemented loop in `test_flows.py`.
+- [x]  **Temperature / Sampling Determinism** — see concept 14 below and `docs/improvements/temperature-determinism.md`. `flows/llm_client.py` defaults `TEMPERATURE`/`JUDGE_TEMPERATURE` to `0` everywhere, independently overridable via `LLM_TEMPERATURE`/`LLM_JUDGE_TEMPERATURE`. `run_dimension_agent` is the one exception — never sets `temperature` when `thinking=True`, since the API requires `temperature=1` with extended thinking on.
 
 ---
 
@@ -32,8 +33,6 @@
 ## TODOs — Other Concepts to Explore
 
 - [ ]  **Batch Processing** — use the Anthropic Batch API to run risk assessments on a list of users (e.g. all contractors) in parallel rather than serially. Useful for bulk audits.
-
-> Human-in-the-Loop and Hooks were previously listed here as `[x]` *and* in Done — duplicated. HITL is now genuinely complete (see Done); Hooks is under **Built but NOT working** above.
 
 ---
 
@@ -103,6 +102,8 @@ if tools.index("flag_user") > tools.index("deactivate_user"):
 Each test runs a real flow against the real MCP server and a real model API — no mocking. This catches the failure mode where mocked tests pass but real Claude behaviour diverges from what the skill intended.
 
 Tests cover: lookup by ID, lookup by email, MFA warning surfacing, high-risk scoring, low-risk scoring, confirmation gate enforcement, inactive user handling, and the flag-before-deactivate safety rule.
+
+**Known gap:** the test harness (`run_test_flow`) reimplements its own tool loop rather than calling `_run_tool_loop`/`_dispatch_tool_use` in `flows/run_flow.py`, so it's missing the order guard, duplicate-call detection, prompt caching, and the iteration cap that the real flows have. As a result, `test_order_guard_blocks_blind_flag`/`test_order_guard_blocks_premature_deactivate` only assert against the static `ORDER_REQUIREMENTS` dict — nothing in the suite drives a real tool call through the order guard's actual runtime error path. See `docs/improvements/evals.md` (Limitations, and planned improvement #6).
 
 ---
 
@@ -217,7 +218,8 @@ Both use `tool_choice={"type": "any"}` to force structured output instead of pro
 ```python
 result = await client.messages.create(
     tools       = [_COMPLETENESS_TOOL],
-    tool_choice = {"type": "any"},   # Claude MUST call the tool, not write prose
+    tool_choice = {"type": "any"},        # Claude MUST call the tool, not write prose
+    temperature = JUDGE_TEMPERATURE,      # forces the shape, not the verdict — see concept 14
     ...
 )
 # returns: {"complete": bool, "missing": [...]}
@@ -227,6 +229,8 @@ return _first_tool_input(
 ```
 
 `tool_choice` forces a tool call but can't guarantee one — truncation or a refusal can leave no readable block. `_first_tool_input()` fails open to the supplied default and tags it `judge_unavailable`, which propagates out as a `warnings` entry on the API response rather than being silently reported as a passed check.
+
+Note `tool_choice` and `temperature` are solving different problems: `tool_choice` only forces the *reply* to be a schema-valid tool call; it says nothing about which valid value (`complete: true` vs `false`) gets picked — that's still sampled, which is why `temperature` is set explicitly rather than left at the API default. See concept 14 below.
 
 See `docs/improvements/llm-as-judge.md` for the full design, including the remaining limitation: judges see only the response text, not the raw tool results, so they check plausibility rather than facts.
 
@@ -604,6 +608,32 @@ call_offboard_phase_stream("/offboard/confirm/stream", user_id, reason)   # Phas
 The existing `offboard-user` skill and single-phase flow are unchanged — backward compatible for direct `run_flow` calls.
 
 See `docs/improvements/human-in-the-loop.md` for the full design.
+
+---
+
+## 14. Temperature / Sampling Determinism
+
+Every model call in this codebase previously ran at the API default `temperature` (`1.0`), so identical requests could produce different tool-call sequences, different risk scores, and different judge/critic verdicts on different runs — a real cost in a security tool, and a source of flakiness in `tests/test_flows.py`'s exact-match assertions.
+
+`flows/llm_client.py` now sets two independent, env-var-backed constants, both defaulting to `0`:
+
+```python
+TEMPERATURE       = float(os.environ.get("LLM_TEMPERATURE", "0"))        # main agentic loop
+JUDGE_TEMPERATURE = float(os.environ.get("LLM_JUDGE_TEMPERATURE", "0"))  # completeness judge + critic
+```
+
+They're split rather than shared: the main loop and the judge/critic calls are conceptually distinct — e.g. a future change might give the main loop's write-up more variance while keeping judge/critic pinned to `0` for control-flow stability.
+
+**Why the judge/critic calls matter most here.** `_check_completeness`/`_critique_response` (concept 6) use `tool_choice={"type": "any"}` to force a schema-valid reply, but that only constrains *shape* — Claude still samples which legal value (`complete: true` vs `false`) comes out, the same as any other generation. Since that verdict directly drives loop control flow (round count, whether a revision pass runs), sampling variance there changes what the flow *does*, not just how it reads.
+
+**One exception:** `run_dimension_agent` (concept 11, extended thinking) never sets `temperature` when `thinking=True` — the API requires `temperature=1` whenever extended thinking is enabled and rejects any other value with a 400.
+
+| Constant | Applies to |
+|---|---|
+| `TEMPERATURE` | `_run_tool_loop`, all `run_flow*_stream` variants, `run_dimension_agent` (non-thinking branch), and `tests/test_flows.py`'s own lightweight loop |
+| `JUDGE_TEMPERATURE` | `_check_completeness`, `_critique_response` |
+
+See `docs/improvements/temperature-determinism.md` for the full design, including the residual limitation: `temperature=0` makes output overwhelmingly reproducible, not a formal determinism guarantee, and it doesn't fix genuinely ambiguous skill instructions — only makes Claude pick the same interpretation consistently.
 
 ---
 

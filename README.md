@@ -118,6 +118,17 @@ export LLM_PROVIDER=bedrock
 
 Add your AWS credentials to `~/.aws/credentials` under the `default` profile with Bedrock access to `us.anthropic.claude-sonnet-4-6` in `us-west-2`. Override the model with `BEDROCK_MODEL_ID`.
 
+### 4. Sampling temperature
+
+`flows/llm_client.py` also sets two `temperature` values, both defaulting to `0` (deterministic — same input, same output):
+
+| Env var | Default | Applies to |
+|---|---|---|
+| `LLM_TEMPERATURE` | `0` | Main agentic loop — tool selection, risk scoring, write-ups |
+| `LLM_JUDGE_TEMPERATURE` | `0` | Completeness judge (`_check_completeness`) and critic (`_critique_response`) |
+
+Raise these if you want more varied phrasing across runs; leave them at `0` for reproducible tool-call sequences and stable eval assertions. One exception: `run_dimension_agent` never sets `temperature` when extended thinking is on (option 8/9) — the API requires `temperature=1` whenever `thinking` is enabled. See `docs/improvements/temperature-determinism.md`.
+
 ---
 
 ## Running the code

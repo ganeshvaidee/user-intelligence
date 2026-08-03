@@ -45,7 +45,7 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    from llm_client import client, MODEL_ID
+    from llm_client import client, MODEL_ID, TEMPERATURE
     print(f"  ✓ Imported llm_client (MODEL_ID={MODEL_ID})")
 except Exception as e:
     print(f"  ✗ Failed to import llm_client: {e}")
@@ -95,11 +95,12 @@ async def run_test_flow(user_request: str, skill_names: list[str]) -> tuple[str,
                 print(f"    [DEBUG] Loop {loop_count}: calling Claude (model={MODEL_ID})")
                 try:
                     response = await client.messages.create(
-                        model      = MODEL_ID,
-                        max_tokens = 2048,
-                        system     = system_prompt,
-                        tools      = tools,
-                        messages   = messages,
+                        model       = MODEL_ID,
+                        max_tokens  = 2048,
+                        temperature = TEMPERATURE,
+                        system      = system_prompt,
+                        tools       = tools,
+                        messages    = messages,
                     )
                 except Exception as e:
                     print(f"    [DEBUG] ERROR calling Claude: {type(e).__name__}: {e}")

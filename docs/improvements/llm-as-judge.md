@@ -50,6 +50,8 @@ This is a general pattern for getting structured output from Claude without need
 
 "Forced" is not "guaranteed", though — a `max_tokens` truncation, a refusal, or a provider-side stop can all end a turn with no complete `tool_use` block. `_first_tool_input` is what handles that; see **When the judge can't be read** below.
 
+**`tool_choice` constrains shape, not content.** Forcing `tool_use` only guarantees the reply parses as valid JSON matching the schema — it says nothing about which legal value gets picked. `complete: true` and `complete: false` are both schema-valid; which one comes out is still resolved by ordinary sampling over Claude's logits, the same as free-text generation. That's exactly what `temperature` governs, and it's why both judges pass `temperature=JUDGE_TEMPERATURE` (default `0`) rather than leaving it at the API default — see `docs/improvements/temperature-determinism.md`. Neither `_COMPLETENESS_TOOL` nor `_CRITIQUE_TOOL` has a backing function or an MCP round-trip; `_check_completeness`/`_critique_response` never call `execute_tool` or `session.call_tool`. The "tool" here shapes Claude's own output — it doesn't delegate the answer to code the way `get_user` or `flag_user` do.
+
 **On `MODEL_ID`:** the judges use the same model as the main flow, imported from `flows/llm_client.py`. That module selects the provider at import time — `BEDROCK_MODEL_ID` from `bedrock_client.py` when running on Bedrock, `MODEL_ID` from `anthropic_client.py` when calling the Anthropic API directly — and re-exports both as `MODEL_ID`. Judge code never references the provider-specific name.
 
 ---
@@ -91,6 +93,7 @@ async def _check_completeness(original_request: str, response: str) -> dict:
     result = await client.messages.create(
         model       = MODEL_ID,
         max_tokens  = 1024,   # 512 could truncate a long list mid-block
+        temperature = JUDGE_TEMPERATURE,
         system      = [{"type": "text", "text": "You are a quality checker for user intelligence assessments. Be precise and critical.", "cache_control": {"type": "ephemeral"}}],
         tools       = [_COMPLETENESS_TOOL],
         tool_choice = {"type": "any"},
@@ -215,6 +218,7 @@ async def _critique_response(original_request: str, response: str) -> dict:
     result = await client.messages.create(
         model       = MODEL_ID,
         max_tokens  = 1024,   # 512 could truncate a long list mid-block
+        temperature = JUDGE_TEMPERATURE,
         system      = [{"type": "text", "text": "You are a critical reviewer of user intelligence risk assessments. Check that risk scores are justified by the evidence shown. Flag any score inflation, unsupported conclusions, or missing caveats.", "cache_control": {"type": "ephemeral"}}],
         tools       = [_CRITIQUE_TOOL],
         tool_choice = {"type": "any"},

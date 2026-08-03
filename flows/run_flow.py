@@ -14,7 +14,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from llm_client import client, MODEL_ID
+from llm_client import client, MODEL_ID, TEMPERATURE
 from tools import (
     USER_TOOLS,
     execute_tool,
@@ -192,11 +192,12 @@ async def _run_tool_loop(
             break
         if verbose:
             async with client.messages.stream(
-                model      = MODEL_ID,
-                max_tokens = 4096,
-                system     = cached_system,
-                tools      = cached_tools,
-                messages   = msgs,
+                model       = MODEL_ID,
+                max_tokens  = 4096,
+                temperature = TEMPERATURE,
+                system      = cached_system,
+                tools       = cached_tools,
+                messages    = msgs,
             ) as stream:
                 async for text in stream.text_stream:
                     print(text, end="", flush=True)
@@ -205,11 +206,12 @@ async def _run_tool_loop(
                 print()
         else:
             response = await client.messages.create(
-                model      = MODEL_ID,
-                max_tokens = 4096,
-                system     = cached_system,
-                tools      = cached_tools,
-                messages   = msgs,
+                model       = MODEL_ID,
+                max_tokens  = 4096,
+                temperature = TEMPERATURE,
+                system      = cached_system,
+                tools       = cached_tools,
+                messages    = msgs,
             )
 
         tool_results = []
@@ -298,11 +300,12 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
         # is fully cleaned up before the next iteration's yield.
         async with start_mcp_session() as session:
             async with client.messages.stream(
-                model      = MODEL_ID,
-                max_tokens = 4096,
-                system     = cached_system,
-                tools      = cached_tools,
-                messages   = messages,
+                model       = MODEL_ID,
+                max_tokens  = 4096,
+                temperature = TEMPERATURE,
+                system      = cached_system,
+                tools       = cached_tools,
+                messages    = messages,
             ) as stream:
                 async for text in stream.text_stream:
                     yield text              # stream immediately
@@ -358,11 +361,12 @@ async def run_flow_until_complete_stream(
                     break
                 tool_results: list[dict] = []
                 async with client.messages.stream(
-                    model      = MODEL_ID,
-                    max_tokens = 4096,
-                    system     = cached_system,
-                    tools      = cached_tools,
-                    messages   = round_messages,
+                    model       = MODEL_ID,
+                    max_tokens  = 4096,
+                    temperature = TEMPERATURE,
+                    system      = cached_system,
+                    tools       = cached_tools,
+                    messages    = round_messages,
                 ) as stream:
                     async for text in stream.text_stream:
                         yield text           # stream immediately — session stays open
@@ -441,7 +445,7 @@ async def run_flow_with_reflection_stream(
                 break
             tool_results: list[dict] = []
             async with client.messages.stream(
-                model=MODEL_ID, max_tokens=4096,
+                model=MODEL_ID, max_tokens=4096, temperature=TEMPERATURE,
                 system=cached_system, tools=cached_tools, messages=messages,
             ) as stream:
                 async for text in stream.text_stream:
@@ -491,7 +495,7 @@ async def run_flow_with_reflection_stream(
                 break
             tool_results = []
             async with client.messages.stream(
-                model=MODEL_ID, max_tokens=4096,
+                model=MODEL_ID, max_tokens=4096, temperature=TEMPERATURE,
                 system=cached_system, tools=cached_tools, messages=messages,
             ) as stream:
                 async for text in stream.text_stream:
@@ -745,8 +749,13 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
                 # spending a fixed budget. display="summarized" is required: the
                 # default is "omitted", which returns thinking blocks with empty text
                 # and would silently break the [THINKING — ...] audit output below.
+                # temperature is deliberately left unset here — the API requires
+                # temperature=1 when extended thinking is enabled and rejects any
+                # other value.
                 create_kwargs["thinking"]      = {"type": "adaptive", "display": "summarized"}
                 create_kwargs["output_config"] = {"effort": "high"}
+            else:
+                create_kwargs["temperature"] = TEMPERATURE
 
             response = await client.messages.create(**create_kwargs)
 

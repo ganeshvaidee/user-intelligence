@@ -21,6 +21,8 @@ async def run_test_flow(user_request, skill_names) -> tuple[str, list[str]]:
 
 Runs a real flow — opens an MCP session, calls the model, executes tool calls — and returns what Claude said and which tools it called. Each test calls this and asserts against the results.
 
+**This is a separate reimplementation, not a call into `flows/run_flow.py`.** `run_test_flow` only reuses `execute_tool`/`start_mcp_session` from `tools.py`; the loop itself, the `messages.create` call, and tool dispatch are written fresh here rather than calling `_run_tool_loop`/`_dispatch_tool_use`. See **Limitations** below for what that costs.
+
 ### Four assertion types
 
 **Tool call assertions** — did Claude call the right tools, and NOT call the wrong ones?
@@ -115,6 +117,15 @@ The test range (10–18) reflects the score a correctly-applied set of rules wou
 
 **Single run per test.** Claude outputs are non-deterministic. A test that passes once might fail on the next run if skill instructions are ambiguous. Single-run tests don't surface this.
 
+**The test harness duplicates production code instead of calling it — and the duplicate is missing guardrails.** `run_test_flow` (`tests/test_flows.py`) reimplements its own lightweight tool loop rather than calling `_run_tool_loop`/`_dispatch_tool_use` in `flows/run_flow.py`. The comment above `_dispatch_tool_use` already documents that this exact pattern caused problems once — "this logic used to be copied five times, and the copies had drifted." `run_test_flow` is effectively a sixth copy that was never folded in. Concretely, it's missing:
+
+- **The `ORDER_REQUIREMENTS` order guard** — `run_test_flow` calls `execute_tool(session, block.name, block.input)` directly, with no check that prerequisites (`get_user_activity` before `flag_user`, `flag_user` before `deactivate_user`) have already succeeded. If Claude ever called a tool out of order during a test, nothing here would catch it or return the synthetic error the real loop would.
+- **Duplicate-call detection** — no `seen_calls` tracking, no warning on a redundant MCP call.
+- **Prompt caching** — passes `system` as a plain string and `tools` as a plain list, no `cache_control` breakpoints.
+- **The iteration cap** — an unbounded `while True` that only exits on `stop_reason == "end_turn"`, with no `_iteration_guard()` equivalent.
+
+**The consequence:** `test_order_guard_blocks_blind_flag` and `test_order_guard_blocks_premature_deactivate` (`tests/test_flows.py`) are named as if they test the runtime order guard, but they only assert against the static `ORDER_REQUIREMENTS` dict — neither calls `run_test_flow` or makes a real model/tool call. So nothing in this suite currently drives an actual tool call through `_dispatch_tool_use`'s order-guard error path end-to-end. The guard's *configuration* is checked; its *runtime enforcement* isn't. `tests/test_offboard_hitl.py` is the one place in the test suite that exercises the real flows rather than this reimplemented loop — a model for what `test_flows.py` would need to move toward to close this gap.
+
 ---
 
 ## Implementation order
@@ -127,6 +138,7 @@ The test range (10–18) reflects the score a correctly-applied set of rules wou
 | 4 | Regression trigger (hooks) | ✅ Done — PostToolUse hook fires tests after any SKILL.md edit |
 | 5 | Golden dataset | ⬜ Planned |
 | 6 | Consistency evals | ⬜ Planned |
+| 7 | Route `run_test_flow` through `_run_tool_loop` | ⬜ Planned |
 
 ---
 
@@ -288,6 +300,37 @@ Auto-run the eval suite when a `SKILL.md` file is edited.
 
 ---
 
+### 6. Route `run_test_flow` through `_run_tool_loop`
+
+Stop reimplementing the tool loop in the test harness — call the real one.
+
+**Problem:** `run_test_flow` is a separate copy of the agentic loop (see **Limitations** above) that is missing the order guard, duplicate-call detection, prompt caching, and the iteration cap. Two tests are named as if they verify the runtime order guard (`test_order_guard_blocks_blind_flag`, `test_order_guard_blocks_premature_deactivate`) but only check the static `ORDER_REQUIREMENTS` dict, because the loop they'd need to drive a real violation through doesn't have the guard wired in at all.
+
+**How it works:** Call `_run_tool_loop(system_prompt, messages, session, tools=tools)` from `run_test_flow` instead of hand-rolling the `while True`/`messages.create` loop, the same way `tests/test_offboard_hitl.py` already drives the real flows rather than a reimplementation:
+
+```python
+async def run_test_flow(user_request: str, skill_names: list[str]) -> tuple[str, list[str]]:
+    system_prompt = _build_system_prompt(load_skill(*skill_names))
+    tools = tools_for_skills(skill_names)
+    messages = [{"role": "user", "content": user_request}]
+    seen_calls: dict = {}
+    completed: set[str] = set()
+
+    async with start_mcp_session() as session:
+        messages, response_text = await _run_tool_loop(
+            system_prompt, messages, session,
+            seen_calls=seen_calls, tools=tools, completed=completed,
+        )
+    tools_called = [key.split(":", 1)[0] for key in seen_calls]   # seen_calls keys are "name:json-args"
+    return response_text, tools_called
+```
+
+`_run_tool_loop` doesn't currently return a flat `tools_called` list — it tracks `seen_calls` keyed by `"{name}:{json.dumps(args, sort_keys=True)}"` instead (see `_dispatch_tool_use`) — so pulling the tool name back out means either splitting that key on the first `:` (as above; safe since tool names never contain `:`) or making `_run_tool_loop` track a plain call-order list alongside `seen_calls`, which is the cleaner fix if this refactor happens.
+
+**Payoff:** one implementation to keep correct instead of two, and the order-guard tests would actually exercise `_dispatch_tool_use`'s error path instead of only its config.
+
+---
+
 ## Implementation order
 
 | Priority | Improvement | Effort | Value |
@@ -297,3 +340,4 @@ Auto-run the eval suite when a `SKILL.md` file is edited.
 | 3 | LLM-as-Judge | Medium — new judge tool + rubrics per test | High — catches semantic failures |
 | 4 | Regression trigger | Low — hook configuration | Medium — prevents silent regressions |
 | 5 | Consistency evals | Medium — N-run loop + variance check | Medium — surfaces ambiguous skills |
+| 6 | Route `run_test_flow` through `_run_tool_loop` | Low — swap the loop body, adjust the return value | High — order guard, duplicate detection, and caching all apply to tests; closes the gap where `test_order_guard_*` only check config, not runtime enforcement |

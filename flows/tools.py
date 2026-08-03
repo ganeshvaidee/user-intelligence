@@ -19,7 +19,7 @@ from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.streamable_http import streamablehttp_client
 
-from llm_client import client, MODEL_ID
+from llm_client import client, MODEL_ID, JUDGE_TEMPERATURE
 
 MCP_SERVER = Path(__file__).parent.parent / "mcp-server" / "server.py"
 MCP_URL    = os.environ.get("MCP_URL")   # set to use HTTP mode, e.g. http://localhost:8001
@@ -301,6 +301,7 @@ async def _check_completeness(original_request: str, response: str) -> dict:
     result = await client.messages.create(
         model       = MODEL_ID,
         max_tokens  = 1024,   # 512 could truncate a long `missing`/`issues` list mid-block
+        temperature = JUDGE_TEMPERATURE,
         system      = [{"type": "text", "text": "You are a quality checker for user intelligence assessments. Be precise and critical.", "cache_control": {"type": "ephemeral"}}],
         tools       = [_COMPLETENESS_TOOL],
         tool_choice = {"type": "any"},
@@ -326,6 +327,7 @@ async def _critique_response(original_request: str, response: str) -> dict:
     result = await client.messages.create(
         model       = MODEL_ID,
         max_tokens  = 1024,   # 512 could truncate a long `missing`/`issues` list mid-block
+        temperature = JUDGE_TEMPERATURE,
         system      = [{"type": "text", "text": "You are a critical reviewer of user intelligence risk assessments. Check that risk scores are justified by the evidence shown. Flag any score inflation, unsupported conclusions, or missing caveats.", "cache_control": {"type": "ephemeral"}}],
         tools       = [_CRITIQUE_TOOL],
         tool_choice = {"type": "any"},

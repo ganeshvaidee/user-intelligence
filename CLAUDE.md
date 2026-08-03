@@ -449,6 +449,8 @@ AWS credentials must be in `~/.aws/credentials` under the `default` profile with
 
 Override the model: `export BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-6`
 
+All LLM calls default to `temperature=0` (deterministic) via `flows/llm_client.py` — `TEMPERATURE` for the main agentic loop, `JUDGE_TEMPERATURE` for the completeness-judge/critic calls, independently overridable with `LLM_TEMPERATURE` / `LLM_JUDGE_TEMPERATURE`. See `docs/improvements/temperature-determinism.md`.
+
 ## Test users
 
 | ID | Name | Profile |
