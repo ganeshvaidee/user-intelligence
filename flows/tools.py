@@ -20,6 +20,7 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.streamable_http import streamablehttp_client
 
 from llm_client import client, MODEL_ID, JUDGE_TEMPERATURE
+from usage import log_usage
 
 MCP_SERVER = Path(__file__).parent.parent / "mcp-server" / "server.py"
 MCP_URL    = os.environ.get("MCP_URL")   # set to use HTTP mode, e.g. http://localhost:8001
@@ -267,6 +268,45 @@ async def execute_tool(session: ClientSession, name: str, inputs: dict) -> str:
 
 
 # ── LLM judge callers ─────────────────────────────────────────────
+#
+# No prompt caching on either judge — deliberately, and measured rather than
+# assumed.
+#
+# THE BINDING REASON — the prefix is below the minimum. The only cacheable
+# content in a judge call is the tool schema plus the system prompt: ~180 tokens,
+# against a 1024-token minimum on Sonnet 4.6. Below that minimum the API silently
+# declines to cache — no error, no warning, just full price. Measured with
+# flows/usage.py on a critic-revise run:
+#
+#     [USAGE] _critique_response  in=1440  cache_w=0  cache_r=0  out=980
+#
+# The other ~1260 tokens are the assessment under review — per-call content that
+# sits after any breakpoint, so no static text remains to push the prefix over
+# the threshold. Note what is NOT the problem: that prefix is byte-identical on
+# every call, forever, across iterations and flows and users. Structurally this
+# is a textbook caching candidate. Size alone rules it out, and no breakpoint
+# placement fixes that.
+#
+# A SECONDARY NOTE, not independently disqualifying. _critique_response runs
+# exactly once per flow (phase 2 of run_flow_with_reflection), so within a single
+# run nothing reads what that call would have written, and the 1.25x write
+# premium would be pure loss. Across runs it differs: the cache lives 5 minutes
+# and the prefix never changes, so two runs inside that window would hit —
+# break-even is roughly two calls (1.25x + 0.1x = 1.35x, versus 2.0x uncached).
+# _check_completeness is a stronger candidate still, running once per convergence
+# round (0-2 times at max_rounds=3) and able to pay off inside a single flow.
+#
+# That ranks the two judges against each other; it is not why either is uncached.
+# If the prefix were 2000 tokens instead of 180, both would get a breakpoint.
+#
+# What was removed, for reference — this is what the no-op looked like:
+#
+#     system = [{"type": "text", "text": "...", "cache_control": {"type": "ephemeral"}}]
+#
+# Well-formed, passes review, caches nothing. Contrast _run_tool_loop in
+# run_flow.py, where the skills system prompt is ~2296 tokens and the same
+# pattern produces real cache hits. See docs/improvements/prompt-caching.md.
+
 
 def _first_tool_input(result, default: dict) -> dict:
     """
@@ -302,7 +342,7 @@ async def _check_completeness(original_request: str, response: str) -> dict:
         model       = MODEL_ID,
         max_tokens  = 1024,   # 512 could truncate a long `missing`/`issues` list mid-block
         temperature = JUDGE_TEMPERATURE,
-        system      = [{"type": "text", "text": "You are a quality checker for user intelligence assessments. Be precise and critical.", "cache_control": {"type": "ephemeral"}}],
+        system      = "You are a quality checker for user intelligence assessments. Be precise and critical.",
         tools       = [_COMPLETENESS_TOOL],
         tool_choice = {"type": "any"},
         messages    = [{
@@ -317,6 +357,7 @@ async def _check_completeness(original_request: str, response: str) -> dict:
     # Fail open as "complete" — a lost verdict must not force an extra round.
     # judge_unavailable marks this as "not actually checked", so callers don't
     # report it as a passed completeness check.
+    log_usage(result, "_check_completeness", cached=False)
     return _first_tool_input(
         result, {"complete": True, "missing": [], "judge_unavailable": True}
     )
@@ -328,7 +369,7 @@ async def _critique_response(original_request: str, response: str) -> dict:
         model       = MODEL_ID,
         max_tokens  = 1024,   # 512 could truncate a long `missing`/`issues` list mid-block
         temperature = JUDGE_TEMPERATURE,
-        system      = [{"type": "text", "text": "You are a critical reviewer of user intelligence risk assessments. Check that risk scores are justified by the evidence shown. Flag any score inflation, unsupported conclusions, or missing caveats.", "cache_control": {"type": "ephemeral"}}],
+        system      = "You are a critical reviewer of user intelligence risk assessments. Check that risk scores are justified by the evidence shown. Flag any score inflation, unsupported conclusions, or missing caveats.",
         tools       = [_CRITIQUE_TOOL],
         tool_choice = {"type": "any"},
         messages    = [{
@@ -343,6 +384,7 @@ async def _critique_response(original_request: str, response: str) -> dict:
     # Fail open as "no issues" — a lost verdict must not trigger a revision pass.
     # judge_unavailable marks this as "not actually reviewed", so callers don't
     # report it as a clean critique.
+    log_usage(result, "_critique_response", cached=False)
     return _first_tool_input(
         result, {"has_issues": False, "issues": [], "judge_unavailable": True}
     )
