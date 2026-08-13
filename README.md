@@ -335,6 +335,8 @@ Run each component independently. This is useful for debugging, IDE integration,
 **Terminal 1 — MCP server (HTTP mode):**
 
 ```bash
+python -m venv path/to/venv
+source path/to/venv/bin/activate
 python mcp-server/server.py --transport http --port 8001
 ```
 
