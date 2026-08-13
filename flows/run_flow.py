@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 from llm_client import client, MODEL_ID, TEMPERATURE
+from usage import log_usage
 from tools import (
     USER_TOOLS,
     execute_tool,
@@ -71,6 +72,78 @@ def _cache_tools(tools: list[dict] | None) -> list[dict]:
     if not tools:
         return []
     return [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}]
+
+
+# At most this many cache breakpoints live inside `messages` at once. The API
+# allows 4 per request and cached_system + _cache_tools already spend two, so
+# this is the whole remaining budget. Two rather than one: if the newest
+# breakpoint misses (see the 20-block note below) the older entry is still
+# readable, which turns a total miss into a partial hit.
+_MAX_CONVERSATION_BREAKPOINTS = 2
+
+
+def _cache_conversation(msgs: list[dict]) -> None:
+    """
+    Move the conversation cache breakpoint to the end of the newest turn.
+
+    Unlike `system` and `tools`, `messages` GROWS every iteration — each call
+    re-sends everything the last one sent plus a new turn. A breakpoint in a
+    fixed position is therefore worthless; it has to advance. Once it does,
+    each call reads the prefix the previous call wrote and pays full price only
+    on the delta added since. Without this, the whole conversation is billed at
+    1.0x on every iteration while the static prefix ahead of it sits at 0.1x —
+    measured at 62% of input tokens by phase 3 of a critic-revise run.
+
+    Mutates msgs in place. Three things are load-bearing:
+
+    1. MOVE, don't accumulate. Adding a breakpoint per iteration without
+       removing the old ones hits
+           400 "A maximum of 4 blocks with cache_control may be provided"
+       on the third iteration. Stale markers are stripped.
+
+    2. Stripping a marker invalidates nothing. cache_control declares where to
+       cut the prefix; it is not part of the cached content, and the prefix
+       match is on the content bytes. Moving a breakpoint forward across a
+       growing conversation is the intended use.
+
+    3. The minimum cacheable prefix is not a concern here, even when the
+       conversation is one short turn. The minimum applies to the ENTIRE prefix
+       ahead of the breakpoint, and `system` (~2296 tokens of skills) renders
+       before `messages` — so a conversation breakpoint clears the 1024-token
+       bar from the moment it exists. Contrast the judge callers in tools.py,
+       which have no large prefix to sit behind and so cannot be cached at all.
+
+    Only tool_result turns are marked: assistant turns hold `response.content`,
+    which is SDK objects rather than dicts, so there is no key to set. Skipping
+    them costs nothing because a tool_result turn always follows one. Plain
+    string turns (the convergence follow-up, the critic's issues message) are
+    skipped too, which is the wanted behaviour — the marker stays on the last
+    tool_result turn and the next phase's first call reads it.
+
+    Watch for the 20-block lookback window: a breakpoint searches back at most
+    20 content blocks for a prior entry. A turn with many parallel tool calls
+    produces ~2 blocks per call, so two iterations of a 5-call turn sits near
+    that limit. An unexpected WRITE where log_usage should show HIT is the
+    symptom.
+    """
+    marked = [
+        block
+        for msg in msgs
+        if isinstance(msg.get("content"), list)
+        for block in msg["content"]
+        if isinstance(block, dict) and "cache_control" in block
+    ]
+
+    newest = msgs[-1].get("content") if msgs else None
+    if isinstance(newest, list) and newest and isinstance(newest[-1], dict):
+        if "cache_control" not in newest[-1]:
+            newest[-1]["cache_control"] = {"type": "ephemeral"}
+            marked.append(newest[-1])
+
+    # marked is oldest-first (msgs walked in order), so this drops everything
+    # but the most recent few.
+    for stale in marked[:-_MAX_CONVERSATION_BREAKPOINTS]:
+        stale.pop("cache_control", None)
 
 
 def _print_header(user_request: str, skill_names: list[str]) -> None:
@@ -202,6 +275,7 @@ async def _run_tool_loop(
                 async for text in stream.text_stream:
                     print(text, end="", flush=True)
                 response = await stream.get_final_message()
+                log_usage(response, "_run_tool_loop")
             if any(b.type == "text" for b in response.content):
                 print()
         else:
@@ -213,6 +287,7 @@ async def _run_tool_loop(
                 tools       = cached_tools,
                 messages    = msgs,
             )
+            log_usage(response, "_run_tool_loop")
 
         tool_results = []
         for block in response.content:
@@ -231,6 +306,7 @@ async def _run_tool_loop(
 
         if tool_results:
             msgs.append({"role": "user", "content": tool_results})
+            _cache_conversation(msgs)
 
     return msgs, accumulated_text
 
@@ -310,6 +386,7 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
                 async for text in stream.text_stream:
                     yield text              # stream immediately
                 response = await stream.get_final_message()
+                log_usage(response, "run_flow_stream")
 
             for block in response.content:
                 if block.type == "tool_use":
@@ -326,6 +403,7 @@ async def run_flow_stream(user_request: str, skill_names: list[str]):
 
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
+            _cache_conversation(messages)
 
 
 async def run_flow_until_complete_stream(
@@ -372,6 +450,7 @@ async def run_flow_until_complete_stream(
                         yield text           # stream immediately — session stays open
                         round_text += text
                     response = await stream.get_final_message()
+                    log_usage(response, "run_flow_until_complete_stream")
 
                 for block in response.content:
                     if block.type == "tool_use":
@@ -385,6 +464,7 @@ async def run_flow_until_complete_stream(
                     break
                 if tool_results:
                     round_messages.append({"role": "user", "content": tool_results})
+                    _cache_conversation(round_messages)
 
             messages = round_messages
         # Session now closed — judge call runs with no session open
@@ -452,6 +532,7 @@ async def run_flow_with_reflection_stream(
                     yield text              # stream immediately
                     initial_text += text
                 response = await stream.get_final_message()
+                log_usage(response, "run_flow_with_reflection/p1")
 
             for block in response.content:
                 if block.type == "tool_use":
@@ -464,6 +545,7 @@ async def run_flow_with_reflection_stream(
                 break
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
+                _cache_conversation(messages)
     # Session closed — critic call runs with no session open
 
     # ── Phase 2 — critic (silent) ─────────────────────────────────
@@ -501,6 +583,7 @@ async def run_flow_with_reflection_stream(
                 async for text in stream.text_stream:
                     yield text              # stream immediately
                 response = await stream.get_final_message()
+                log_usage(response, "run_flow_with_reflection/p3")
 
             for block in response.content:
                 if block.type == "tool_use":
@@ -513,6 +596,7 @@ async def run_flow_with_reflection_stream(
                 break
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
+                _cache_conversation(messages)
 
 
 async def run_flow_until_complete(
@@ -758,6 +842,7 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
                 create_kwargs["temperature"] = TEMPERATURE
 
             response = await client.messages.create(**create_kwargs)
+            log_usage(response, f"run_dimension_agent/{dimension}")
 
             tool_results = []
             for block in response.content:
@@ -788,6 +873,7 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
                 break
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
+                _cache_conversation(messages)
 
     return score_result or {"score": 0, "max_score": 0, "factors": [], "evidence": []}, tools_called
 
