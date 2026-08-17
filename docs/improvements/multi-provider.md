@@ -157,10 +157,18 @@ Running `run_flow("Look up user usr_001…", ["_base", "lookup-user"])` against 
 
 It looped until the `MAX_TOOL_ITERATIONS` circuit breaker and returned an empty answer. This was not an inability to emit the argument: asked directly, the model produces `{"user_id": "usr_001", "days": 7}` every time. The failure is holding an intention across a turn boundary under a long prompt — precisely the long-horizon consistency that a 4-bit 30B gives up relative to Claude.
 
+**It is not a memory or context failure**, and that is the natural wrong inference. Tool results are not something the model has to retain: `_run_tool_loop` re-sends the entire conversation on every iteration, so the `days: 30` payload and the `tool_use` block that requested it sit side by side in the input on the turn where the model asks for it again. Nothing was forgotten. What failed is binding the result to the request that asked for it.
+
+**Nor is it parameter count, and "open-weight" is a license, not a capability.** Discharging a sub-goal after a `tool_result` is installed by post-training on multi-turn tool-use trajectories, not by pretraining or by scale — a smaller model trained hard on agentic loops will do this better than a larger one that was not. Muse Glimmer is distilled from Muse Spark, and long-horizon agentic control is among the first things distillation gives up. Read the comparison with Claude that way; reading it as a size threshold predicts the wrong fix.
+
 `_dispatch_tool_use` already detected the duplicates. It printed a warning and dispatched anyway, so the model received the identical bytes that had just failed to satisfy it. Two changes fixed it:
 
 - An exact-duplicate **read** now returns a corrective error instead of re-dispatching, in the same style as the order guard. Writes are exempt — the state guards in `database.py` are the authority there — and a successful write clears the cached reads, since re-reading after a state change is a real question.
 - That correction alone was **not enough**: the model read it, agreed with it in its reasoning, and made the identical call eight more times. So the guard escalates. On the third identical call it stops explaining and instructs: *stop calling tools, write the final answer now, mark anything you could not obtain as unavailable.*
+
+**Why the escalation worked when the correction did not** — worth understanding before adding any further guard, because it is not what it looks like. A degenerate loop is self-reinforcing: once the first repeat is in the conversation, the context contains a demonstration that at this point the assistant calls `get_user_activity` with these arguments. Generation is pattern completion, so each repeat is further evidence for repeating, and the loop tightens on itself. A courteous error dict leaves that surface pattern intact — which is exactly how the model could read it, agree with it, and complete the pattern anyway. The escalated message works because it disrupts the pattern, not because it argues the point better.
+
+The design lever is therefore **salience, not clarity**. The instinct on the next loop will be to write a more detailed explanation; that is precisely what already failed here.
 
 With the escalation the same flow converges in 9 tool calls / 6 model turns, and the model handles the gap honestly:
 
