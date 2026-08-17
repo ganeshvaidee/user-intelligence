@@ -10,3 +10,6 @@ env/
 .claude/settings.local.json
 
 seed/users.db
+
+.DS_Store
+.vscode/

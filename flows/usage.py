@@ -25,6 +25,8 @@
 
 import os
 
+from llm_client import supports
+
 LOG_USAGE = os.environ.get("LLM_LOG_USAGE", "1").lower() not in ("0", "false", "no", "")
 
 # Per-site running totals. asyncio is single-threaded and every writer here runs
@@ -63,10 +65,20 @@ def log_usage(response, where: str, cached: bool = True) -> None:
     Pass cached=False from call sites that intentionally send no cache_control
     breakpoint, so they are not counted as misplaced ones. See the judge callers
     in tools.py for the only current example.
+
+    On a provider without explicit caching, `cached` is forced to False no
+    matter what the call site asked for. The flows send cache_control markers
+    unconditionally — that is by design, not a bug — but on vLLM
+    those markers are dropped in translation, so counting them as DEAD would
+    flag every single call as a breakpoint bug. Real prefix-cache hits still
+    show up: openai_compat_client maps prompt_tokens_details.cached_tokens onto
+    cache_read_input_tokens, so `read` is populated and the verdict is HIT.
     """
     usage = getattr(response, "usage", None)
     if usage is None:
         return
+
+    cached = cached and supports("prompt_caching")
 
     inp     = getattr(usage, "input_tokens", 0) or 0
     created = getattr(usage, "cache_creation_input_tokens", 0) or 0

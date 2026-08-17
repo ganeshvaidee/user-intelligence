@@ -88,6 +88,61 @@ FLOWS = {
 }
 
 
+_thinking_buffers: dict[str, str] = {}
+
+
+def _render_event(event: dict) -> bool:
+    """
+    Render one SSE event. Returns True when the stream is finished.
+
+    Shared by both streaming callers. It used to be copy-pasted into each, and
+    this repo has already been bitten by that: duplicate tool-call detection
+    drifted across five copies until only one still worked. One implementation
+    means a new event type cannot land in half the client.
+
+    Routing rule — stdout carries the answer and nothing else, so it stays
+    pipeable. Warnings and reasoning go to stderr.
+    """
+    if event.get("done"):
+        _flush_thinking()
+        print()
+        return True
+
+    if "error" in event:
+        _flush_thinking()
+        print(f"\nERROR: {event['error']}")
+        sys.exit(1)
+
+    if "warning" in event:
+        # A degradation notice, e.g. a judge that returned no verdict.
+        print(f"\n⚠  WARNING: {event['warning']}", file=sys.stderr)
+
+    if "thinking" in event:
+        # A dimension agent's reasoning, streamed live. Deltas arrive as
+        # fragments and four agents stream concurrently, so buffer per dimension
+        # and emit whole lines — raw passthrough interleaves them mid-word.
+        dim = event.get("dimension", "?")
+        buf = _thinking_buffers.get(dim, "") + event["thinking"]
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            if line.strip():
+                print(f"\033[2m[{dim}] {line.strip()}\033[0m", file=sys.stderr, flush=True)
+        _thinking_buffers[dim] = buf
+
+    if "text" in event:
+        print(event["text"], end="", flush=True)
+
+    return False
+
+
+def _flush_thinking() -> None:
+    """Emit trailing partial lines — usually each agent's concluding thought."""
+    for dim, buf in _thinking_buffers.items():
+        if buf.strip():
+            print(f"\033[2m[{dim}] {buf.strip()}\033[0m", file=sys.stderr, flush=True)
+    _thinking_buffers.clear()
+
+
 def call_orchestrator_stream(user_request: str, skill_names: list, flow_type: str = "single", max_rounds: int = 3) -> None:
     """Stream any flow, printing tokens as they arrive."""
     try:
@@ -102,20 +157,8 @@ def call_orchestrator_stream(user_request: str, skill_names: list, flow_type: st
                 for line in response.iter_lines():
                     if not line.startswith("data: "):
                         continue
-                    event = json.loads(line[6:])
-                    if event.get("done"):
-                        print()
+                    if _render_event(json.loads(line[6:])):
                         break
-                    if "error" in event:
-                        print(f"\nERROR: {event['error']}")
-                        sys.exit(1)
-                    if "warning" in event:
-                        # Not response content — a degradation notice, e.g. a
-                        # judge that returned no verdict. Keep it off stdout so
-                        # piped output stays clean.
-                        print(f"\n⚠  WARNING: {event['warning']}", file=sys.stderr)
-                    if "text" in event:
-                        print(event["text"], end="", flush=True)
     except httpx.ConnectError:
         print(f"\nERROR: Could not connect to orchestrator at {ORCHESTRATOR_URL}")
         print("Is it running?  MCP_URL=http://localhost:8001 python orchestrator/app.py")
@@ -157,20 +200,8 @@ def call_offboard_phase_stream(endpoint: str, user_id: str, reason: str) -> None
                 for line in response.iter_lines():
                     if not line.startswith("data: "):
                         continue
-                    event = json.loads(line[6:])
-                    if event.get("done"):
-                        print()
+                    if _render_event(json.loads(line[6:])):
                         break
-                    if "error" in event:
-                        print(f"\nERROR: {event['error']}")
-                        sys.exit(1)
-                    if "warning" in event:
-                        # Not response content — a degradation notice, e.g. a
-                        # judge that returned no verdict. Keep it off stdout so
-                        # piped output stays clean.
-                        print(f"\n⚠  WARNING: {event['warning']}", file=sys.stderr)
-                    if "text" in event:
-                        print(event["text"], end="", flush=True)
     except httpx.ConnectError:
         print(f"\nERROR: Could not connect to orchestrator at {ORCHESTRATOR_URL}")
         print("Is it running?  MCP_URL=http://localhost:8001 python orchestrator/app.py")
