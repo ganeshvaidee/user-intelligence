@@ -1,14 +1,32 @@
-# Extended Thinking (Option 8)
+# Extended Thinking (Options 8 and 9)
 
-> **Scope: Option 7 only.**
-> Extended Thinking is enabled exclusively in `run_dimension_agent` (`flows/run_flow.py`), which is called only by `run_flow_parallel_risk` (option 7 — "Risk assessment (parallel agents + extended thinking)").
-> Options 1–6 use standard model calls with no thinking parameter.
+> **Scope: options 8 and 9.**
+> Extended Thinking is enabled exclusively in `run_dimension_agent` (`flows/run_flow.py`). That function is called by two flows:
+> - `run_flow_parallel_risk` — option **7** passes `thinking=False`, option **8** passes `thinking=True`
+> - `run_flow_parallel_risk_with_memory` — option **9**, which hardcodes `thinking=True`
+>
+> So option 7 runs the same four parallel agents with thinking off, so comparing **7 with 8** shows what thinking alone changes. Options 1–7 otherwise use standard model calls with no thinking parameter.
 
 ---
 
+## What it is
+
+Extended thinking spends extra compute at inference time. Before writing the response the model generates reasoning tokens — a working area that is not the answer and is not addressed to the reader. Only then does it produce the user-facing output.
+
+Without it, the model emits the answer token by token from the first forward pass onward. Every word is committed as it is generated; there is no place to work something out and then decide not to use it. Extended thinking supplies that place, and the budget buys four things:
+
+- **Decomposition** — split a rule with several conditions into one check at a time, instead of evaluating the whole thing in one pass.
+- **Hypothesis and self-critique** — propose a value, then test it against the rule that asked for it.
+- **Backtracking** — reach for the wrong number, notice the mismatch, and discard it. This is the one that cannot be simulated by a more detailed prompt, because it requires having already written the wrong thing down.
+- **Planning before committing** — sequence the steps, then execute, rather than deciding the shape of the answer while emitting it.
+
+In this codebase `display` is set to `"summarized"`, so that reasoning comes back in the response and is printed — see [Implementation](#implementation). It is a working area, not a hidden one.
+
 ## Problem
 
-The parallel dimension agents score risk correctly but implicitly. Claude reads data, applies scoring rules, and calls `report_dimension_score` — but the intermediate reasoning is invisible. On borderline cases (failure rate is 19.8%, threshold is 20%; account age is 31 days, threshold is 30) there's no way to verify the score without re-reading the raw data yourself.
+The parallel dimension agents score risk correctly but implicitly. Claude reads data, applies scoring rules, and calls `report_dimension_score` — but the intermediate reasoning is invisible, and the output is a single integer with no way to check it short of re-reading the raw data yourself.
+
+The specific failure this guards against is **window conflation**. Two of the four auth rules are scoped to different time windows, so the agent calls `get_user_activity` twice and holds two payloads with identical field names, distinguished only by the `days` argument sent in an earlier message. Reading a field from the wrong one is a silent two-point error. Worked through on real data below.
 
 ## Solution
 
@@ -16,11 +34,92 @@ Adaptive thinking adds a `thinking` parameter to the model call. Claude reasons 
 
 ---
 
+## When to use it
+
+**Use extended thinking when working out the answer takes many steps, but the answer itself is short and cannot be revised.**
+
+That is the shape it pays for. A dimension agent emits `score: 4` — one number — but reaching it means checking four conditions against exact values and summing them: a long path to a short answer. Without a scratchpad the model must produce that integer in a single forward pass.
+
+| Turn it on when | Leave it off when |
+|---|---|
+| The output is a **commitment** — a score, a classification, a go/no-go | The work is retrieval and formatting (option 1 — the skill's rules fully determine the output) |
+| Working it out needs **exact comparisons** or must keep several similar values straight | The tool sequence is fixed and the mapping is mechanical |
+| A wrong intermediate step needs to be **recoverable** — reached for, recognised, discarded | Every intermediate step is forced by the data with no room to go wrong |
+| You need to **defend** the answer, not just produce it — the trace is evidence | You need **reproducibility** (see the temperature constraint below) |
+| The call is **one-shot** — no judge or critic downstream to catch it | A cheaper mechanism already covers you — a completeness judge (option 5) or critic (option 6) catches omissions after the fact for far fewer tokens |
+
+### The mechanism, on real data
+
+`usr_005` (Eve Contractor) in the seed database, scored against the four rules in `skills/risk-auth/SKILL.md`. Two of them are window-scoped, which is where the trouble is:
+
+```
+rule: MFA disabled                  → +2
+rule: >10 failed logins in 30 days  → +2      ← 30-day window
+rule: >5  unique IPs  in  7 days    → +2      ←  7-day window
+rule: no login in 90+ days          → +1
+```
+
+The three tool results the agent has in context:
+
+```
+get_user(usr_005)                   → mfa_enabled: 0, employee_type: contractor,
+                                      last_login: 18 days ago, created_at: 74 days ago
+get_user_activity(usr_005, days=30) → {total: 60, failures: 15, unique_ips: 60}
+get_user_activity(usr_005, days=7)  → {total:  0, failures:  0, unique_ips:  0}
+```
+
+**Without extended thinking — 6/6, incorrect:**
+
+```
+MFA disabled                → +2
+15 failed logins > 10       → +2
+60 unique IPs > 5           → +2      ← read from the 30-day payload
+Last login 18 days ago      → +0
+Total: 6/6
+```
+
+**With extended thinking — 4/6, correct.** The reasoning binds each value to its window before summing, and one of those steps is a retraction:
+
+```
+mfa_enabled = 0 → +2. Running total 2.
+Rule 2 is scoped to 30 days. 30-day failures = 15. 15 > 10 → +2. Running total 4.
+Rule 3 is scoped to 7 days, not 30. I have two payloads — take the days=7 one.
+  7-day unique_ips = 0. 0 > 5 is false → +0. Running total 4.
+  (The 30-day figure is 60, which would score. Wrong window. Discard it.)
+Dormancy: last_login 18 days ago against a 90-day threshold → +0.
+Total 4/6.
+```
+
+**Why the first one failed.** Not confusing `failures` with `unique_ips` — those are distinct field names. Confusing **which of two identically-shaped payloads** a field came from. The only thing separating the two is the `days` argument sent in an earlier message, and the wrong value is the persuasive one: 60 unique IPs across 60 events means every request came from a different address, exactly the pattern the rule exists to catch. Two points too high on a six-point dimension, and it propagates to the headline — 16/15 instead of 14/15.
+
+The line in parentheses is the part a better prompt cannot replace. The model reaches for 60, recognises the window mismatch, and drops it. Doing that requires having written the wrong number down first, which is precisely what a single forward pass has nowhere to do. Not more intelligence — somewhere to write the intermediate step down, and permission to cross it out.
+
+Note that this, rather than a near-threshold comparison, is the case that actually bites in this dataset. 15/60 = 25% against a 20% threshold is not close; keeping two windows straight across four rules is.
+
+#### The example only works on an aged database
+
+`seed_activity` places all 60 of Eve's events within `random.randint(1, 168)` hours — the whole history is inside 7 days at the moment of seeding, and ages out of that window afterwards:
+
+| Database state | `days=30`<br>`total`/`failures`/`unique_ips` | `days=7`<br>`total`/`failures`/`unique_ips` | Correct auth score |
+|---|---|---|---|
+| Immediately after `python seed/seed.py` | 60 / 15 / 60 | **59 / 15 / 59** | 6/6 |
+| After ~18 days | 60 / 15 / 60 | **0 / 0 / 0** | 4/6 |
+
+On a fresh seed the two payloads are nearly identical, both windows clear the >5 threshold, and the conflation is invisible — correct and incorrect reasoning both land on 6/6. Reproducing the discrimination above needs a database that has had time to age past the 7-day boundary.
+
+### What it costs
+
+Accuracy at the moment the model commits to an answer, paid in output tokens, latency, and determinism — `temperature` is forced to `1` (see below). If a flow never has to commit to a short, final answer, all three are spent for nothing.
+
+**Compare options 7 and 8 to isolate thinking** — identical four-agent architecture, `thinking=False` vs `True`. Comparing 5 with 8 confounds thinking with parallel decomposition and with judge-vs-no-judge.
+
+---
+
 ## Where it lives
 
 **One function:** `run_dimension_agent(dimension, user_id, verbose, thinking)` in `flows/run_flow.py`.
 
-This function is called four times concurrently by `run_flow_parallel_risk` via `asyncio.gather`. Each call decides its own thinking depth independently.
+This function is called four times concurrently via `asyncio.gather` — by `run_flow_parallel_risk` (options 7 and 8) and by `run_flow_parallel_risk_with_memory` (option 9). Each call decides its own thinking depth independently.
 
 ---
 
@@ -48,7 +147,9 @@ Three parameters do the work:
 | `display="summarized"` | **Required, not cosmetic.** The default is `"omitted"`, which returns thinking blocks whose `.thinking` field is an empty string. Without this the `[THINKING — …]` audit output below prints blank blocks — no error, just silently no reasoning to audit. |
 | `output_config={"effort": "high"}` | Controls thinking depth and overall token spend. This is the successor to the old fixed-budget knob. |
 
-`MODEL_ID` comes from `flows/llm_client.py`, which resolves it per provider — `us.anthropic.claude-sonnet-4-6` on Bedrock (an inference-profile ID, overridable with `BEDROCK_MODEL_ID`), `claude-sonnet-4-6` on the direct Anthropic API (overridable with `ANTHROPIC_MODEL_ID`). All three thinking parameters behave identically on both.
+`MODEL_ID` comes from `flows/llm_client.py`, which resolves it per provider — `us.anthropic.claude-sonnet-4-6` on Bedrock (an inference-profile ID, overridable with `BEDROCK_MODEL_ID`), `claude-sonnet-4-6` on the direct Anthropic API (overridable with `ANTHROPIC_MODEL_ID`). All three thinking parameters behave identically on those two.
+
+On the `local` provider they do not, and `run_dimension_agent` gates on `llm_client.supports("thinking_blocks")` because of it. `thinking` sends nothing on the wire — the model reasons unprompted and returns the trace in `reasoning_content`, which the adapter maps back to a `ThinkingBlock`; `effort` becomes a `Reasoning strength: high` line in the system prompt; and the `temperature=1` constraint below does not apply, since that belongs to Anthropic extended thinking specifically. See `docs/improvements/multi-provider.md`.
 
 **No `temperature` here — and that's required, not an oversight.** Every other model call in this codebase passes `temperature=TEMPERATURE` (default `0`; see `docs/improvements/temperature-determinism.md`), but the API rejects any value other than `1` when `thinking` is enabled. `run_dimension_agent` builds its `create_kwargs` conditionally: `temperature=TEMPERATURE` is only added in the `else` branch, when `thinking=False`. Setting `thinking=True` and a non-default temperature together is a 400 error, not a silent override.
 
@@ -96,7 +197,7 @@ for block in response.content:
 "required": ["score", "max_score", "factors", "evidence", "reasoning"]
 ```
 
-Claude fills this after thinking — it's a concise version of the thinking block that surfaces in the synthesized report without forwarding the full thinking content. Because `reasoning` is **required**, the Agent Reasoning section always appears in option 7 output, confirming extended thinking ran.
+Claude fills this after thinking — it's a concise version of the thinking block that surfaces in the synthesized report without forwarding the full thinking content. Because `reasoning` is **required**, the Agent Reasoning section appears in options 7, 8 and 9 alike. Note what that means: the section's *presence* does not confirm thinking ran, since option 7 fills the same field without it. Only the `[THINKING — …]` blocks in verbose output do.
 
 ---
 
@@ -125,48 +226,55 @@ Thinking blocks print to the terminal before each agent's score:
 
 ```
 [THINKING — AUTH]
-Checking get_user: mfa_enabled = false → +2.
+Checking get_user: mfa_enabled = 0 → +2.
 get_user_activity(days=30): failures=15, total=60. 15 > 10 threshold → +2.
-get_user_activity(days=7): unique_ips=8. 8 > 5 → +2.
-Last login: 2 days ago. Not dormant → +0.
-Total: 6/6.
+get_user_activity(days=7): unique_ips=0. Not > 5 → +0.
+  (30-day unique_ips is 60, but rule 3 is scoped to 7 days. Wrong window.)
+Last login: 18 days ago against a 90-day threshold. Not dormant → +0.
+Total: 4/6.
 
 [THINKING — PERMISSIONS]
 get_user: employee_type = contractor.
-get_user_permissions: admin-prod-db (admin) → +2.
-write-billing (write, sensitive) → +1. write-users (write, sensitive) → +1.
-deploy-prod (write, prod-infra — not in sensitive list) → +0.
+get_user_permissions: admin-prod-db (admin), access-admin-panel (admin) → +2.
+write-users (write, user-data — sensitive) → +1.
+write-billing (write, billing — sensitive) → +1.
+read-secrets (secrets is sensitive, but level is read) → +0.
+deploy-prod (write, prod-infra — not in the sensitive list) → +0.
 Contractor with high-risk perms → +2.
 Total: 2+2+2 = 6. Cap at 5 (max). Score: 5/5.
 ...
 ```
 
+The permissions trace shows the same shape without the retraction: two of Eve's six permissions look like they should score and do not — `read-secrets` because the resource is sensitive but the level is `read`, `deploy-prod` because the level is `write` but `prod-infra` is not in the sensitive list. Both require holding resource and level together rather than matching on either alone.
+
 ### Three-service mode (client → orchestrator)
 
-Thinking blocks are not forwarded over SSE. The report always includes an Agent Reasoning section:
+Thinking is forwarded over SSE as `{"thinking": "<delta>", "dimension": "<name>"}` events, which `client/cli.py` renders dimmed to **stderr** so it stays separable from the report on stdout — see `docs/improvements/streaming.md`. The report itself always includes an Agent Reasoning section:
 
 ```
 ## Risk Assessment — usr_005 (Parallel Agents + Extended Thinking)
 
-Risk Score: 13/15   Level: 🔴 Critical
+Risk Score: 14/15   Level: 🔴 Critical
 
 ### Score Breakdown
-| Dimension      | Score | Key Factors                                    |
-|----------------|-------|------------------------------------------------|
-| Authentication | 6/6   | MFA disabled (+2), >10 failed logins (+2), ... |
-| Permissions    | 5/5   | Admin perms (+2), Write to billing (+1), ...   |
-| Behaviour      | 4/4   | Failure rate >20% (+2), Sensitive access (+1), |
-| Account        | 1/3   | Contractor type (+1)                           |
+| Dimension      | Score | Key Factors                                        |
+|----------------|-------|----------------------------------------------------|
+| Authentication | 4/6   | MFA disabled (+2), >10 failed logins (+2)           |
+| Permissions    | 5/5   | Admin perms (+2), Write to sensitive (+2), ...      |
+| Behaviour      | 4/4   | Failure rate >20% (+2), Sensitive access (+1), ...  |
+| Account        | 1/3   | Contractor type (+1)                               |
 
 ### Recommended Action
 Immediate deactivation recommended
 
 ### Agent Reasoning
-- **Authentication:** No MFA on a contractor account with 15 failed logins from 8 external IPs
-- **Permissions:** Admin DB access + write to billing combined with contractor status
-- **Behaviour:** 25% failure rate exceeds 20% threshold; accessed secrets and admin-panel
-- **Account:** Contractor type only — not flagged, not new
+- **Authentication:** No MFA on a contractor account with 15 failed logins in 30 days; no activity at all in the last 7 days, so the unique-IP rule does not fire
+- **Permissions:** Admin DB and admin-panel access plus write to user-data and billing, combined with contractor status — 6 points capped at 5
+- **Behaviour:** 15 failures out of 60 events = 25%, above the 20% threshold; accessed secrets, prod-database and admin-panel; events outside 08:00–18:00
+- **Account:** Contractor type only — not flagged, and 74 days old so not new
 ```
+
+Those are the scores for the current aged database — 4 + 5 + 4 + 1 = 14/15. The window-conflation error described above would report Authentication as 6/6 and a headline of 16/15, which exceeds the maximum and is the cheapest signal that something went wrong.
 
 The Agent Reasoning section is proof extended thinking ran — it is populated exclusively from the `reasoning` field that each agent writes after thinking.
 
@@ -182,22 +290,13 @@ The Agent Reasoning section is proof extended thinking ran — it is populated e
 | 4 | Find by email + risk | ❌ |
 | 5 | Convergence loop | ❌ |
 | 6 | Critic-revise | ❌ |
-| **7** | **Parallel agents** | **✅ per dimension agent** |
+| 7 | Parallel agents | ❌ — `thinking=False` |
+| **8** | **Parallel agents + extended thinking** | **✅ per dimension agent** |
+| **9** | **Parallel + extended thinking + memory** | **✅ per dimension agent** |
 
 ---
 
 ## Planned improvements
-
-### Forward thinking to the client via SSE
-
-Add a `thinking` event type to the SSE stream so the client can display thinking blocks in real time:
-
-```
-data: {"thinking_start": "auth"}\n\n
-data: {"thinking": "MFA disabled → +2. Failed logins: 15 > 10 → +2..."}\n\n
-data: {"thinking_end": "auth"}\n\n
-data: {"text": "## Risk Assessment..."}\n\n
-```
 
 ### Tune `effort` per dimension
 

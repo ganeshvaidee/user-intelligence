@@ -28,6 +28,16 @@ async with client.messages.stream(
 
 `stream.text_stream` yields only text chunks — tool_use blocks are not streamed as text. After the stream completes, `get_final_message()` returns the full `Message` object with all content blocks (text + tool_use), which is needed to process tool calls.
 
+**Thinking is not in `text_stream` either**, which matters once a call has extended thinking enabled: the model emits its whole reasoning block before the first answer token, so `text_stream` stays silent for that entire stretch and the caller looks frozen. Iterating the stream itself yields typed events instead:
+
+```python
+async for event in stream:
+    if   event.type == "thinking": event.thinking   # incremental delta
+    elif event.type == "text":     event.text
+```
+
+The SDK synthesises `ThinkingEvent` and `TextEvent` from the raw `content_block_delta` frames, and `flows/openai_compat_client.py` emits the same two shapes from `reasoning_content` — so one loop covers every provider with no branch. `run_dimension_agent` (options 8 and 9) uses this; the five other stream call sites still use `text_stream`, because none of them enables thinking and there is nothing extra to surface.
+
 This means streaming does not change tool execution logic — it only changes how text output is delivered to the user.
 
 ---
@@ -205,7 +215,16 @@ call_orchestrator_stream(user_request, skill_names, flow_type)
 | Three-service, flow_type=single | Client terminal via SSE | ✅ — `/flow/stream` |
 | Three-service, flow_type=convergence | Client terminal via SSE | ✅ — `/flow/stream` (text per round, judge calls silent) |
 | Three-service, flow_type=reflection | Client terminal via SSE | ✅ — `/flow/stream` (Phase 1 + Phase 3 text, critic silent) |
-| Orchestrator verbose=False | None (programmatic) | ❌ — `client.messages.create()` unchanged |
+| Options 8/9, CLI | Terminal, **stdout** | ✅ — reasoning per dimension, `[THINKING — AUTH] …` |
+| Options 8/9, three-service | Client terminal, **stderr** | ✅ — `{"thinking", "dimension"}` over SSE, dimmed and labelled |
+| Orchestrator verbose=False | None (programmatic) | ❌ — the blocking `/flow` endpoint is unchanged |
+
+The final report on options 8/9 still arrives in one piece: the four agents are gathered concurrently and the report is assembled by Python from their structured scores, so there is no token-level text to stream. What streams is the reasoning that precedes it — which is where all the wall-clock goes.
+
+Two implementation notes on the options 8/9 rows:
+
+- **`asyncio.gather` cannot be iterated**, so `run_dimension_agent` takes an `on_thinking(dimension, delta)` callback instead of being a generator. The CLI passes a printer; the orchestrator passes a queue push, and `_stream_parallel()` drains that queue while the gather task runs, then drains again before yielding the report so the closing lines of each trace are not lost.
+- **Deltas must be buffered per dimension.** Four concurrent agents interleave mid-word; `ThinkingPrinter` accumulates to a newline and emits one labelled line. Raw passthrough is unreadable.
 
 ---
 

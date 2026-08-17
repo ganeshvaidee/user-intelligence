@@ -36,9 +36,9 @@
 
 ---
 
-## 0. Model Provider: Bedrock or the Anthropic API
+## 0. Model Provider: Anthropic, Bedrock, or a Local Open-Weight Model
 
-Every concept below runs against a Claude model, and the project can reach that model two ways. `flows/llm_client.py` picks one at **import time** and re-exports a single `client` and `MODEL_ID` that the rest of the codebase uses. No other file knows which provider is active:
+`flows/llm_client.py` picks a provider at **import time** and re-exports a single `client` and `MODEL_ID` that the rest of the codebase uses. No other file knows which provider is active:
 
 ```python
 # flows/llm_client.py
@@ -46,26 +46,50 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic")
 
 if LLM_PROVIDER == "bedrock":
     from bedrock_client import client, BEDROCK_MODEL_ID as MODEL_ID
+elif LLM_PROVIDER in ("local", "openai"):
+    from openai_compat_client import make_client
+    client, MODEL_ID = make_client(LLM_PROVIDER)
 else:
     from anthropic_client import client, MODEL_ID
 ```
 
-**The default is the direct Anthropic API** — Bedrock is opt-in via `LLM_PROVIDER=bedrock`.
+**Four providers, and the Anthropic path is deliberately privileged:**
 
-|  | Direct Anthropic API (default) | AWS Bedrock |
-|---|---|---|
-| Selected by | `LLM_PROVIDER` unset or any value other than `bedrock` | `LLM_PROVIDER=bedrock` |
-| Client module | `flows/anthropic_client.py` | `flows/bedrock_client.py` |
-| SDK class | `anthropic.AsyncAnthropic()` | `anthropic.AsyncAnthropicBedrock(...)` |
-| Auth | `ANTHROPIC_API_KEY`, or an `ant auth login` profile | AWS credentials from the `default` boto3 profile (access key, secret, session token) |
-| Region | n/a | `us-west-2`, set in `bedrock_client.py` |
-| Default model ID | `claude-sonnet-4-6` | `us.anthropic.claude-sonnet-4-6` (a cross-region inference profile) |
-| Model override | `ANTHROPIC_MODEL_ID` | `BEDROCK_MODEL_ID` |
-| Extra dependency | none | `boto3` |
+| `LLM_PROVIDER` | What |
+|---|---|
+| unset / `anthropic` | Direct Anthropic API — the default |
+| `bedrock` | Claude via AWS Bedrock |
+| `local` | Open-weight model on LM Studio / vLLM / SGLang |
+| `openai` | Hosted OpenAI API |
+
+`anthropic` and `bedrock` are both Claude, so everything below applies to them unchanged. **`local` and `openai` are different in kind**: `run_flow.py` and `tools.py` are written unconditionally in the Anthropic Messages shape — `cache_control`, `thinking`, `output_config`, forced `tool_choice`, `messages.stream` — and `flows/openai_compat_client.py` emulates that surface over `/v1/chat/completions`. The adapter matches that surface and is allowed to support less; what it must never do is force the Anthropic code to become more generic or add `if provider ==` branches. That file is the only one permitted to `import openai`, enforced by `tests/test_provider_isolation.py`.
+
+Full details, including what was measured against Muse Glimmer 30B, are in [multi-provider.md](improvements/multi-provider.md).
+
+|  | Direct Anthropic API (default) | AWS Bedrock | Local open-weight |
+|---|---|---|---|
+| Selected by | `LLM_PROVIDER` unset or `anthropic` | `LLM_PROVIDER=bedrock` | `LLM_PROVIDER=local` |
+| Client module | `flows/anthropic_client.py` | `flows/bedrock_client.py` | `flows/openai_compat_client.py` |
+| SDK class | `anthropic.AsyncAnthropic()` | `anthropic.AsyncAnthropicBedrock(...)` | `openai.AsyncOpenAI(base_url=...)`, wrapped to present the Messages surface |
+| Auth | `ANTHROPIC_API_KEY`, or an `ant auth login` profile | AWS credentials from the `default` boto3 profile (access key, secret, session token) | none — `LOCAL_API_KEY` defaults to a placeholder the server ignores |
+| Region / endpoint | n/a | `us-west-2`, set in `bedrock_client.py` | `LOCAL_BASE_URL`, default `http://localhost:8000/v1` |
+| Default model ID | `claude-sonnet-4-6` | `us.anthropic.claude-sonnet-4-6` (a cross-region inference profile) | `meta-models/Muse-Glimmer-30B`, override with `LOCAL_MODEL_ID` |
+| Model override | `ANTHROPIC_MODEL_ID` | `BEDROCK_MODEL_ID` | `LOCAL_MODEL_ID` |
+| Extra dependency | none | `boto3` | `openai` — `flows/requirements-local.txt` |
 
 The model IDs differ in form: Bedrock inference-profile IDs carry a `us.` region prefix and an `anthropic.` vendor prefix, while the direct API takes the bare model name. This is why code samples in these docs say `MODEL_ID` rather than either literal — `llm_client.py` resolves it.
 
-**What does *not* change between providers:** the Messages API request and response shape, tool schemas, `tool_choice`, prompt caching (`cache_control`), extended thinking, streaming, and the `usage` fields. Every concept documented below works identically on both. The only provider-specific things in this project are client construction, credentials, and the model-ID string.
+**Between the two Claude providers, nothing changes:** the Messages API request and response shape, tool schemas, `tool_choice`, prompt caching (`cache_control`), extended thinking, streaming, and the `usage` fields are identical on Bedrock and the direct API. The only differences are client construction, credentials, and the model-ID string.
+
+**On `local` and `openai` that uniformity does not hold**, and the differences are worth knowing before reading the rest of this document:
+
+| Concept | Behaviour on `local` / `openai` |
+|---|---|
+| Prompt caching (§8) | No `cache_control` — the markers are dropped in translation. vLLM/LM Studio prefix-cache automatically; hits surface as `prompt_tokens_details.cached_tokens` and are mapped onto `cache_read_input_tokens`. There is no write counter, so `cache_w` stays 0 and `usage.py` suppresses its `DEAD` verdict |
+| Extended thinking (§11) | `thinking` sends nothing on the wire — Muse Glimmer reasons unprompted and returns the trace in `reasoning_content`, which the adapter maps to a `ThinkingBlock`. `effort` becomes a `Reasoning strength: <level>` line in the system prompt. The `temperature=1` constraint does not apply |
+| Streaming (§9) | Works, but the model emits a large reasoning block before any answer token, so `text_stream` is silent for 15–30s per turn. That reasoning is now streamed separately as `ThinkingEvent` |
+| Forced `tool_choice` (§6) | Enforced on LM Studio, vLLM and SGLang via guided decoding — the judges stay structured. Not guaranteed on other backends |
+| Anything else Anthropic-only | Refused with `UnsupportedFeature`, never silently dropped |
 
 Setup instructions for each provider are in the [README](../README.md#3-model-access).
 
@@ -312,6 +336,16 @@ Two surfaces are implemented:
 
 **Orchestrator SSE endpoint** (`/flow/stream`) — a new FastAPI endpoint backed by the `run_flow_stream` async generator. Yields SSE events token by token; the client consumes them and prints to the terminal in real time.
 
+**Reasoning streams separately.** `stream.text_stream` yields only the visible answer, so a reasoning model appears frozen while it thinks — 15–30s per turn on a local 30B, and however long extended thinking takes on Claude. Iterating the stream itself instead yields typed events, and one loop covers both providers:
+
+```python
+async for event in stream:
+    if   event.type == "thinking": event.thinking   # incremental delta
+    elif event.type == "text":     event.text
+```
+
+The Anthropic SDK synthesises those events natively; `openai_compat_client` emits the same two shapes from `reasoning_content`. `run_dimension_agent` uses this to stream each agent's reasoning live — see §11.
+
 ```
 data: {"text": "## Risk Assessment"}\n\n
 data: {"text": " — Eve Contractor (usr_005)"}\n\n
@@ -431,13 +465,15 @@ asyncio.gather(auth agent, permissions agent, behaviour agent, account agent)
 
 ## 11. Extended Thinking
 
-> **Scope: Option 7 only** (`run_flow_parallel_risk` → `run_dimension_agent`). Options 1–6 do not use extended thinking.
+> **Scope: options 8 and 9** (`run_dimension_agent`, reached via `run_flow_parallel_risk` with `thinking=True` and via `run_flow_parallel_risk_with_memory`). Option **7** runs the same four parallel agents with thinking **off**, so comparing 7 with 8 shows what thinking alone changes. Options 1–7 do not use extended thinking.
+>
+> **When is it worth enabling?** Short answer: when working out the answer takes many steps but the answer itself is short and cannot be revised — a score, a classification, a go/no-go. Not for retrieval and formatting, and not where you need reproducibility, since `thinking` forces `temperature=1`. The full heuristic, with a worked example from the seed data, is in [extended-thinking.md](improvements/extended-thinking.md#when-to-use-it).
 
 Extended Thinking enables Claude to reason step-by-step *before* producing its final output. The thinking is returned as a separate `ThinkingBlock` alongside the response. For risk scoring, this makes the scoring logic auditable — you can see exactly which conditions Claude evaluated, what the data showed, and why each triggered (or didn't).
 
-**Without extended thinking** (options 1–6): Claude reads the data and produces a score. The reasoning is implicit — you see `Authentication: 6/6` but not how Claude counted the failed logins or whether it applied the right threshold.
+**Without extended thinking** (options 1–7): Claude reads the data and produces a score. The reasoning is implicit — you see `Authentication: 6/6` but not how Claude counted the failed logins or whether it applied the right threshold.
 
-**With extended thinking** (option 7): Claude thinks through each condition explicitly before calling `report_dimension_score`:
+**With extended thinking** (options 8 and 9): Claude thinks through each condition explicitly before calling `report_dimension_score`:
 
 ```
 [THINKING — AUTH]
@@ -470,9 +506,9 @@ response = await client.messages.create(
 
 ### Where to see it
 
-**All-in-one CLI** (`python flows/run_flow.py` → option 7, verbose=True): thinking blocks print as `[THINKING — AUTH]`, `[THINKING — PERMISSIONS]` etc. before each agent's score.
+**All-in-one CLI** (`python flows/run_flow.py` → option 8 or 9, verbose=True): thinking is **streamed live** to stdout as `[THINKING — AUTH] …`, `[THINKING — PERMISSIONS] …`, labelled per dimension because all four agents interleave.
 
-**Three-service mode** (client → orchestrator → option 7): thinking is not forwarded over SSE, but the synthesized report always includes an **Agent Reasoning** section — a one-sentence summary each agent writes after thinking, captured via the required `reasoning` field in `report_dimension_score`:
+**Three-service mode** (client → orchestrator → option 8 or 9): thinking **is** forwarded over SSE as `{"thinking": …, "dimension": …}` and rendered by the client to **stderr**, dimmed, so stdout stays pipeable. The synthesized report also includes an **Agent Reasoning** section — a one-sentence summary each agent writes after thinking, captured via the required `reasoning` field in `report_dimension_score`:
 
 ```
 ### Agent Reasoning
@@ -496,7 +532,7 @@ See `docs/improvements/extended-thinking.md` for the full design.
 
 Every risk assessment previously started cold — Claude had no awareness of whether it had assessed the same user before or whether the risk profile was trending up or down. Memory adds continuity: each completed assessment is saved to the database, and the next run retrieves it before launching the agents. Pure Python computes the delta and adds a comparison section to the report.
 
-**No skill changes needed.** The memory fetch and save are Python-driven via MCP tool calls — not instructions to Claude. The agents score their dimensions independently (unchanged from option 7/8); only the synthesis step sees the prior result.
+**No skill changes needed.** The memory fetch and save are Python-driven via MCP tool calls — not instructions to Claude. The agents score their dimensions independently (unchanged from option 8); only the synthesis step sees the prior result.
 
 ### How it works
 

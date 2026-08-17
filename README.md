@@ -62,6 +62,11 @@ For detailed explanations of the AI/Claude concepts implemented in this project,
 - **Orchestration Patterns** — single-shot, convergence loop, critic-revise, parallel risk
 - **Client Options 1–9** — mapping from user choice → skills → tools → flow pattern
 
+Deep dives on individual changes live in **[docs/improvements/](docs/improvements/)**. Two worth knowing about:
+
+- **[multi-provider.md](docs/improvements/multi-provider.md)** — why the Anthropic code path is never made more generic to accommodate Bedrock, local open-weight or OpenAI-compatible providers; what was measured against Muse Glimmer 30B, and what still is not
+- **[extended-thinking.md](docs/improvements/extended-thinking.md)** — when extended thinking is worth enabling in an application, and when it costs three things for nothing
+
 ---
 
 ## Setup
@@ -88,7 +93,14 @@ python seed/seed.py
 
 ### 3. Model access
 
-`flows/llm_client.py` picks the model backend based on the `LLM_PROVIDER` env var. Two options:
+`flows/llm_client.py` picks the model backend based on the `LLM_PROVIDER` env var. Four options. **Anthropic is the default**, and the code is written for it directly; the others are adapted to look like the Anthropic Messages API and are allowed to support less. See [docs/improvements/multi-provider.md](docs/improvements/multi-provider.md).
+
+| `LLM_PROVIDER` | Backend |
+|---|---|
+| unset / `anthropic` | Direct Anthropic API (default) |
+| `bedrock` | Claude via AWS Bedrock |
+| `local` | Open-weight model on LM Studio / vLLM / SGLang |
+| `openai` | Hosted OpenAI API |
 
 #### Option A — Direct Anthropic API (default)
 
@@ -117,6 +129,55 @@ export LLM_PROVIDER=bedrock
 ```
 
 Add your AWS credentials to `~/.aws/credentials` under the `default` profile with Bedrock access to `us.anthropic.claude-sonnet-4-6` in `us-west-2`. Override the model with `BEDROCK_MODEL_ID`.
+
+#### Option C — Local open-weight model
+
+Runs against any OpenAI-compatible server. Verified against **Muse Glimmer 30B on LM Studio** (Apple Silicon, 4-bit).
+
+```bash
+pip install -r flows/requirements-local.txt   # adds the openai SDK
+lms server start                              # LM Studio, port 1234
+
+export LLM_PROVIDER=local
+export LOCAL_BASE_URL=http://127.0.0.1:1234/v1
+export LOCAL_MODEL_ID=meta/muse-glimmer
+```
+
+Check the wiring before spending minutes on a flow — this takes ~60s and names the fix for each failure:
+
+```bash
+LLM_PROVIDER=local python scripts/local_smoke.py
+```
+
+On Linux/NVIDIA the same adapter serves vLLM or SGLang; only the two env vars differ:
+
+```bash
+vllm serve meta-models/Muse-Glimmer-30B --enable-auto-tool-choice --reasoning-parser ...
+export LOCAL_BASE_URL=http://127.0.0.1:8000/v1
+export LOCAL_MODEL_ID=meta-models/Muse-Glimmer-30B
+```
+
+**Expect minutes, not seconds.** A lookup that Claude finishes in seconds takes ~4 minutes on a 30B running locally. Tool calling, forced `tool_choice`, reasoning traces and the reasoning-depth directive all work; the differences are documented in [multi-provider.md](docs/improvements/multi-provider.md).
+
+`scripts/local.sh` wraps all of the above — it exports the env vars, installs the `openai` extra if missing, starts LM Studio if it is down, then runs what you ask for:
+
+```bash
+./scripts/local.sh              # Mode 1, the interactive flow menu
+./scripts/local.sh check        # the ~60s wiring check
+./scripts/local.sh serve        # the orchestrator, i.e. Mode 3's Terminal 2
+./scripts/local.sh tests/test_flows.py --mode single
+```
+
+#### Option D — Hosted OpenAI API
+
+Same adapter, different endpoint:
+
+```bash
+pip install -r flows/requirements-local.txt
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+export OPENAI_MODEL_ID=gpt-5          # optional
+```
 
 ### 4. Sampling temperature
 
@@ -250,9 +311,16 @@ Runs 4 independent agents in parallel. Each agent:
 | Agent 4 | `risk-account` | Account (flagged status, contractor, age) | 3 |
 
 **Extended thinking & memory (Options 8–9):**
-- Each agent can use extended thinking for deeper reasoning
-- System compares against prior assessments from DB (`get_prior_assessment`)
-- Outputs "Change Since Prior Assessment" section
+- Each agent uses extended thinking for deeper reasoning — option 7 is the same four agents with thinking off, so 7 vs 8 isolates what thinking buys
+- Reasoning is **streamed live**, labelled per dimension because all four agents interleave:
+
+  | Where you run it | Output goes to | Looks like |
+  |---|---|---|
+  | `python flows/run_flow.py` | stdout | `[THINKING — AUTH] MFA disabled → +2` |
+  | `python client/cli.py` | **stderr**, dimmed | `[auth] MFA disabled → +2` |
+
+  stderr keeps stdout pipeable: `python client/cli.py > report.md 2> thinking.log` splits the assessment from the trace.
+- Memory (option 9 only) compares against prior assessments from DB (`get_prior_assessment`) and outputs a "Change Since Prior Assessment" section
 
 **When to use:**
 - CLI options 7, 8, 9 (parallel ± extended thinking ± memory)
@@ -352,6 +420,17 @@ MCP server starting on http://0.0.0.0:8001
 python -m venv path/to/venv
 source path/to/venv/bin/activate
 MCP_URL=http://localhost:8001 python orchestrator/app.py --port 8000
+```
+
+**The orchestrator is the only process that calls the model**, so it is the only one that needs `LLM_PROVIDER`. Setting it in the MCP server's shell or the client's does nothing — the MCP server just executes tools, and the client just speaks HTTP. To run this terminal against a local model:
+
+```bash
+./scripts/local.sh serve                      # sets LLM_PROVIDER + MCP_URL, then execs app.py
+
+# or the raw equivalent
+LLM_PROVIDER=local LOCAL_BASE_URL=http://127.0.0.1:1234/v1 \
+  LOCAL_MODEL_ID=meta/muse-glimmer MCP_URL=http://localhost:8001 \
+  python orchestrator/app.py --port 8000
 ```
 
 **Terminal 3 — Client:**

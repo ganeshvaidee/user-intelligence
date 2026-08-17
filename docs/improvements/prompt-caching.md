@@ -244,4 +244,11 @@ Set `LLM_LOG_USAGE=0` to silence. `usage_summary()` returns per-site totals and 
 2. **Option 6** (critic-revise, `usr_005`) — the only flow that exercises a judge unconditionally, since `_critique_response` has no guard.
 3. `python tests/test_flows.py` — all 8 tests should pass unchanged; caching is transparent to output, which is exactly why the tests cannot detect any of this.
 
-The same numbers are readable off any response object directly (`response.usage.cache_read_input_tokens`, etc.) and work identically on both providers. On Bedrock they are also visible in the AWS console under Model invocations; there is no equivalent console view on the direct Anthropic API.
+The same numbers are readable off any response object directly (`response.usage.cache_read_input_tokens`, etc.) and work identically on Bedrock and the direct Anthropic API. On Bedrock they are also visible in the AWS console under Model invocations; there is no equivalent console view on the direct Anthropic API.
+
+**On the local / OpenAI-compatible provider, none of this applies.** There is no `cache_control`: the flows still send breakpoints — that is by design, not a bug — but `openai_compat_client` drops them in translation, because vLLM and LM Studio prefix-cache automatically with no breakpoint to place. Two consequences for the numbers above:
+
+- `cache_creation_input_tokens` is permanently `0`. There is no write counter to read, so the `cache_w` column stays empty and no WRITE verdict ever appears.
+- Real hits still register. Where the server reports `prompt_tokens_details.cached_tokens`, the adapter maps it onto `cache_read_input_tokens` and subtracts it from `input_tokens` — Anthropic excludes cache reads from `input_tokens`, so without that subtraction the hit rate would be double-counted in the flattering direction.
+
+`log_usage` forces `cached=False` whenever the provider lacks `prompt_caching` in `llm_client.CAPABILITIES`. Without that, every call on this provider would be reported `DEAD` and the column would stop meaning "misplaced breakpoint" — see `docs/improvements/multi-provider.md`.
