@@ -2,7 +2,7 @@
 
 ## What this project does
 
-An IT-security agentic flow: Claude reads **skills** (natural-language rules) and calls **tools** (database operations) to look up users, assess risk, and offboard accounts. All model calls go through **AWS Bedrock** (Claude Sonnet via `AsyncAnthropicBedrock`).
+An IT-security agentic flow: Claude reads **skills** (natural-language rules) and calls **tools** (database operations) to look up users, assess risk, and offboard accounts. Model calls go through the **Anthropic API** by default, with Bedrock and OpenAI-compatible (including local open-weight) providers selectable via `LLM_PROVIDER` — see [Providers](#providers).
 
 ---
 
@@ -16,7 +16,8 @@ run_flow.py          ← loads skills, runs agentic loop, manages MCP session
      │
      ├── skills/     ← Markdown files injected into Claude's system prompt
      │
-     ├── Bedrock     ← Claude model via AWS (bedrock_client.py)
+     ├── LLM         ← Anthropic by default; Bedrock / OpenAI-compatible
+     │                 selectable via LLM_PROVIDER (llm_client.py)
      │
      └── MCP session ← tools.py opens a session to mcp-server/server.py
                            │
@@ -27,7 +28,7 @@ Three files do all the work:
 
 | File | Responsibility |
 |---|---|
-| `flows/bedrock_client.py` | Bedrock client + model ID — one place to change credentials or model |
+| `flows/llm_client.py` | Provider toggle + capability declaration — the only file that knows which vendor is active |
 | `flows/tools.py` | Tool schemas Claude sees, MCP session lifecycle, LLM judge helpers |
 | `flows/run_flow.py` | Skill loading, agentic loop, three flow patterns |
 
@@ -408,7 +409,10 @@ This means:
 ```
 user-intelligence/
 ├── flows/
+│   ├── llm_client.py       ← provider toggle + capability declaration
+│   ├── anthropic_client.py ← direct Anthropic API client (the default)
 │   ├── bedrock_client.py   ← AWS Bedrock client (boto3 + AsyncAnthropicBedrock)
+│   ├── openai_compat_client.py ← OpenAI/vLLM adapter (only file importing openai)
 │   ├── tools.py            ← USER_TOOLS schemas, execute_tool(), MCP session, judge helpers
 │   └── run_flow.py         ← orchestration, skill loader, flow patterns, examples
 │
@@ -445,9 +449,35 @@ pip install -r mcp-server/requirements.txt   # anthropic[bedrock], boto3, fastmc
 python seed/seed.py                          # create users.db with test data
 ```
 
-AWS credentials must be in `~/.aws/credentials` under the `default` profile with Bedrock access to `us.anthropic.claude-sonnet-4-6` in `us-west-2`.
+### Providers
 
-Override the model: `export BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-6`
+`LLM_PROVIDER` selects the client. **Anthropic is the default**, and `run_flow.py`/`tools.py` are written for its API directly. The other providers are adapted to look like it and are allowed to support less — but adding one must never make the Anthropic code more generic. See `docs/improvements/multi-provider.md`.
+
+| `LLM_PROVIDER` | Model env var | Notes |
+|---|---|---|
+| `anthropic` (default) | `ANTHROPIC_MODEL_ID` | direct API |
+| `bedrock` | `BEDROCK_MODEL_ID` | AWS credentials in `~/.aws/credentials` under `default`, Bedrock access to `us.anthropic.claude-sonnet-4-6` in `us-west-2` |
+| `local` | `LOCAL_MODEL_ID`, `LOCAL_BASE_URL` | open-weight model on LM Studio/vLLM/SGLang |
+| `openai` | `OPENAI_MODEL_ID`, `OPENAI_API_KEY` | hosted OpenAI API |
+
+`local` and `openai` need an extra install (`pip install -r flows/requirements-local.txt`) and runs through `flows/openai_compat_client.py`, the only file permitted to `import openai`. The local path is verified against Muse Glimmer 30B on LM Studio:
+
+```bash
+lms server start
+export LLM_PROVIDER=local
+export LOCAL_BASE_URL=http://127.0.0.1:1234/v1
+export LOCAL_MODEL_ID=meta/muse-glimmer
+```
+
+Verify the wiring before spending minutes on a flow — `scripts/local_smoke.py` checks reachability, tool calling, forced `tool_choice`, reasoning traces and adapter refusals in ~60s, and names the fix for each failure:
+
+```bash
+LLM_PROVIDER=local python scripts/local_smoke.py
+```
+
+Then `python flows/run_flow.py` for a real flow. Expect ~4 minutes for a lookup that Claude finishes in seconds. See `docs/improvements/multi-provider.md` for the full test ladder, what was measured, and what still is not.
+
+Adding a provider means editing `_CAPABILITIES` in `flows/llm_client.py` and nothing in the flows. `tests/test_provider_isolation.py` fails the build if provider handling leaks out of that layer.
 
 All LLM calls default to `temperature=0` (deterministic) via `flows/llm_client.py` — `TEMPERATURE` for the main agentic loop, `JUDGE_TEMPERATURE` for the completeness-judge/critic calls, independently overridable with `LLM_TEMPERATURE` / `LLM_JUDGE_TEMPERATURE`. See `docs/improvements/temperature-determinism.md`.
 
@@ -623,6 +653,12 @@ The user deactivation flow has two critical dependencies:
    - Claude recovers by calling `flag_user` first (which itself requires activity lookup)
 
 This creates a **chain of enforcement**: to deactivate, you must flag; to flag, you must look at activity. The order guard makes violations impossible, not just discouraged by prose.
+
+### Duplicate guard
+
+A repeated **read** with byte-identical arguments cannot return new information, so `_dispatch_tool_use` answers it with an error instead of re-dispatching, and escalates to a hard "stop calling tools, write your answer now" on the third attempt. `WRITE_TOOLS` (in `flows/tools.py`) are exempt — `database.py`'s state guards are the authority there — and a successful write clears the cached reads so re-reading after a state change still works.
+
+This exists because a local open-weight model looped ten times on one call and returned nothing. It is dormant for Claude, which does not repeat an identical call three times. See `docs/improvements/multi-provider.md`.
 
 ### 6. Skills: Update `SKILL.md` files
 

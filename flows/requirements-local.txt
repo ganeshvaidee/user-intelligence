@@ -1,0 +1,14 @@
+# Optional extra — needed only for LLM_PROVIDER=local or =openai.
+#
+# Deliberately NOT in mcp-server/requirements.txt: the default Anthropic path
+# must install and run without an OpenAI SDK anywhere on the machine. Only
+# flows/openai_compat_client.py imports this, and only when the toggle selects
+# it. See tests/test_provider_isolation.py.
+#
+#   pip install -r flows/requirements-local.txt
+#
+# The model server itself is separate — install vLLM in its own environment:
+#   pip install vllm
+#   vllm serve meta-models/Muse-Glimmer-30B --enable-auto-tool-choice
+
+openai>=1.40.0

@@ -87,6 +87,14 @@ ORDER_REQUIREMENTS: dict[str, list[str]] = {
 }
 
 
+# Tools that change state. Two consequences in _dispatch_tool_use:
+#   - a repeated write is warned about but still dispatched, because the state
+#     guards in database.py are the real authority on whether it is legal
+#   - a successful write invalidates the read cache, since a re-read after a
+#     flag or deactivation is asking a genuinely different question
+WRITE_TOOLS: set[str] = {"flag_user", "deactivate_user", "save_assessment"}
+
+
 # ── User intelligence tool schemas ────────────────────────────────────
 
 USER_TOOLS = [

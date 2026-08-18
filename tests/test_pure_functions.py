@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "flows"))
 
 from run_flow import (  # noqa: E402
     MAX_TOOL_ITERATIONS,
+    ThinkingPrinter,
     _build_system_prompt,
     _cache_tools,
     _is_error_result,
@@ -222,7 +223,56 @@ def test_build_system_prompt_embeds_the_skills():
     return True, "skills embedded"
 
 
+def test_thinking_printer_reassembles_interleaved_fragments():
+    """
+    Four dimension agents stream concurrently under asyncio.gather, so deltas
+    from different dimensions arrive interleaved and split mid-word. Printing
+    them straight through is unreadable; each dimension must buffer to a newline
+    and emit one labelled line.
+    """
+    import io
+    buf = io.StringIO()
+    printer = ThinkingPrinter(stream=buf)
+    for dimension, fragment in [
+        ("auth",  "MFA dis"),
+        ("perms", "admin "),
+        ("auth",  "abled -> +2\n"),
+        ("perms", "found -> +2\n"),
+    ]:
+        printer.emit(dimension, fragment)
+
+    lines = buf.getvalue().splitlines()
+    if lines != ["[THINKING — AUTH] MFA disabled -> +2",
+                 "[THINKING — PERMS] admin found -> +2"]:
+        return False, f"fragments did not reassemble per dimension: {lines}"
+    return True, "interleaved mid-word fragments reassembled"
+
+
+def test_thinking_printer_flush_emits_the_tail():
+    """
+    Without a flush the final partial line is silently dropped — and that line is
+    usually the agent's conclusion, the part worth reading.
+    """
+    import io
+    buf = io.StringIO()
+    printer = ThinkingPrinter(stream=buf)
+    printer.emit("auth", "no trailing newline here")
+    if buf.getvalue():
+        return False, "emitted an incomplete line before flush"
+
+    printer.flush()
+    if "no trailing newline here" not in buf.getvalue():
+        return False, "flush lost the trailing partial line"
+
+    printer.flush()
+    if buf.getvalue().count("no trailing newline here") != 1:
+        return False, "flush is not idempotent — buffers must clear"
+    return True, "tail flushed once"
+
+
 TESTS = [
+    test_thinking_printer_reassembles_interleaved_fragments,
+    test_thinking_printer_flush_emits_the_tail,
     test_cache_tools_marks_only_the_last,
     test_cache_tools_stays_under_the_api_limit,
     test_cache_tools_handles_every_tool_at_once,

@@ -10,6 +10,7 @@
 # Run: python orchestrator/app.py [--port 8000]
 
 import sys
+import asyncio
 import json
 import logging
 import traceback
@@ -126,6 +127,51 @@ async def run_flow_endpoint(req: FlowRequest):
     return FlowResponse(response=result, flow_type=req.flow_type, warnings=warnings)
 
 
+async def _stream_parallel(start_flow, unpack: bool):
+    """
+    Turn a parallel-risk flow into a live async generator.
+
+    The four dimension agents run under asyncio.gather and cannot be iterated —
+    they push reasoning through an `on_thinking(dimension, delta)` callback
+    instead. So the flow runs as a task while this generator drains a queue and
+    forwards each fragment, then yields the finished report last.
+
+    `start_flow(sink)` must return the flow coroutine with `sink` already wired
+    in. `unpack` is True for run_flow_parallel_risk, which returns
+    (report, tools_called), and False for the memory variant, which returns the
+    report alone.
+
+    Three things are load-bearing:
+
+    1. The queue is unbounded and the sink uses put_nowait, so a slow SSE
+       consumer can never block a dimension agent mid-generation.
+    2. The drain loop waits on the queue with a timeout rather than joining the
+       task, so output flows while the agents are still running.
+    3. After the task completes the queue is drained AGAIN before yielding the
+       report. Fragments queued between the last poll and the task finishing
+       would otherwise be dropped — and those are the closing lines of each
+       agent's reasoning, the most useful part.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def sink(dimension: str, delta: str) -> None:
+        queue.put_nowait({"thinking": delta, "dimension": dimension})
+
+    task = asyncio.create_task(start_flow(sink))
+
+    while not task.done():
+        try:
+            yield await asyncio.wait_for(queue.get(), timeout=0.1)
+        except asyncio.TimeoutError:
+            continue
+
+    while not queue.empty():
+        yield queue.get_nowait()
+
+    result = await task          # re-raises inside the endpoint's try/except
+    yield result[0] if unpack else result
+
+
 @app.post("/flow/stream")
 async def run_flow_stream_endpoint(req: FlowRequest):
     """
@@ -147,19 +193,22 @@ async def run_flow_stream_endpoint(req: FlowRequest):
             elif req.flow_type == "reflection":
                 gen = run_flow_with_reflection_stream(req.user_request, req.skill_names)
             elif req.flow_type in ("risk-parallel", "risk-parallel-thinking"):
-                # Parallel risk runs synchronously then returns; wrap in an async generator
                 _thinking = req.flow_type == "risk-parallel-thinking"
-                async def _parallel_gen():
-                    result, _ = await run_flow_parallel_risk(req.user_request, verbose=False, thinking=_thinking)
-                    yield result
-                gen = _parallel_gen()
+                gen = _stream_parallel(
+                    lambda sink: run_flow_parallel_risk(
+                        req.user_request, verbose=False, thinking=_thinking, on_thinking=sink,
+                    ),
+                    unpack = True,
+                )
             elif req.flow_type == "risk-parallel-memory":
                 # Note: unlike run_flow_parallel_risk, the memory variant returns
                 # the report alone, not (report, tools_called) — do not unpack.
-                async def _memory_gen():
-                    result = await run_flow_parallel_risk_with_memory(req.user_request, verbose=False)
-                    yield result
-                gen = _memory_gen()
+                gen = _stream_parallel(
+                    lambda sink: run_flow_parallel_risk_with_memory(
+                        req.user_request, verbose=False, on_thinking=sink,
+                    ),
+                    unpack = False,
+                )
             else:
                 yield f"data: {json.dumps({'error': f'Unknown flow_type: {req.flow_type}'})}\n\n"
                 return
@@ -169,7 +218,12 @@ async def run_flow_stream_endpoint(req: FlowRequest):
                 # out-of-band events (currently {"warning": ...}). Forward dicts
                 # verbatim so the client can distinguish them from content.
                 if isinstance(chunk, dict):
-                    logger.warning("Flow '%s' emitted: %s", req.flow_type, chunk)
+                    # Only degradation notices are worth a log line. Reasoning
+                    # fragments arrive one per token — logging those would write
+                    # thousands of WARNING lines per assessment and bury the
+                    # notices that actually matter.
+                    if "thinking" not in chunk:
+                        logger.warning("Flow '%s' emitted: %s", req.flow_type, chunk)
                     yield f"data: {json.dumps(chunk)}\n\n"
                 else:
                     yield f"data: {json.dumps({'text': chunk})}\n\n"

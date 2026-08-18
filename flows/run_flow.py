@@ -13,8 +13,9 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Callable
 
-from llm_client import client, MODEL_ID, TEMPERATURE
+from llm_client import client, MODEL_ID, TEMPERATURE, supports
 from usage import log_usage
 from tools import (
     USER_TOOLS,
@@ -24,6 +25,7 @@ from tools import (
     _critique_response,
     tools_for_skills,
     ORDER_REQUIREMENTS,
+    WRITE_TOOLS,
 )
 
 SKILLS_DIR = Path(__file__).parent.parent / "skills"
@@ -207,13 +209,62 @@ async def _dispatch_tool_use(
     read it. Adding a guardrail here now covers every flow at once.
     """
     cache_key = f"{block.name}:{json.dumps(block.input, sort_keys=True)}"
-    if cache_key in seen_calls:
+    is_write  = block.name in WRITE_TOOLS
+    repeats   = seen_calls.get(cache_key, 0)
+    repeated  = repeats > 0
+    seen_calls[cache_key] = repeats + 1
+
+    if repeated:
         print(f"[DUPLICATE TOOL CALL] {block.name}({json.dumps(block.input)}) already called — redundant MCP call")
-    else:
-        seen_calls[cache_key] = True
 
     if verbose:
         print(f"\n[TOOL CALL] {block.name}({json.dumps(block.input, indent=2)})")
+
+    # Repeating a read with identical arguments cannot produce new information,
+    # so re-dispatching it just hands the model the same bytes that already
+    # failed to satisfy it. Weaker models will then repeat the call forever:
+    # Muse Glimmer 30B locked into exactly this on a lookup, re-calling
+    # get_user_activity ten times because the skill asks for days=7, it kept
+    # omitting the argument, and the days=30 result never matched what it
+    # expected. Warning alone did not break the cycle; only the circuit breaker
+    # ended the run.
+    #
+    # Answering with a corrective error instead — the same technique as the
+    # order guard — turns a silent loop into something the model can act on.
+    # Writes are exempt: their state guards in database.py are the real
+    # authority, and a repeated write is a different question from a repeated
+    # read.
+    if repeated and not is_write:
+        # Escalate. A single polite correction is not enough: Muse Glimmer read
+        # "use the previous result", agreed with it in its reasoning, and then
+        # made the identical call again — eight more times, until the circuit
+        # breaker ended the run with no answer at all. What a stuck model needs
+        # is not a better explanation of the mistake but an instruction to stop
+        # gathering and start writing.
+        #
+        # Dormant on the Anthropic path, which does not repeat a call three
+        # times; it costs nothing there and rescues the run here.
+        if repeats >= 2:
+            result = json.dumps({
+                "error": (
+                    f"STOP CALLING TOOLS. You have called {block.name} with these exact "
+                    f"arguments {repeats + 1} times. No further tool call will return "
+                    f"anything new. Write your final answer now using the tool results "
+                    f"already in this conversation, and state any field you could not "
+                    f"obtain as 'unavailable'."
+                )
+            })
+        else:
+            result = json.dumps({
+                "error": (
+                    f"Duplicate call: {block.name} was already called with these exact "
+                    f"arguments and its result is already in this conversation. Use that "
+                    f"result. If you need different data, change the arguments."
+                )
+            })
+        if verbose:
+            print(f"[TOOL RESULT] {result}\n")
+        return {"type": "tool_result", "tool_use_id": block.id, "content": result}
 
     missing = [req for req in ORDER_REQUIREMENTS.get(block.name, []) if req not in completed]
     if missing:
@@ -224,6 +275,12 @@ async def _dispatch_tool_use(
         result = await execute_tool(session, block.name, block.input)
         if not _is_error_result(result):
             completed.add(block.name)
+            if is_write:
+                # State moved. A re-read that was redundant a moment ago is now
+                # a legitimate way to confirm what changed, so drop the cached
+                # reads. Write entries stay, so a repeated write still warns.
+                for key in [k for k in seen_calls if k.split(":", 1)[0] not in WRITE_TOOLS]:
+                    del seen_calls[key]
 
     if verbose:
         display = result[:300] + "..." if len(result) > 300 else result
@@ -799,12 +856,58 @@ _RISK_LEVELS = [
 ]
 
 
-async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = False, thinking: bool = True) -> dict:
+class ThinkingPrinter:
+    """
+    Buffers streamed reasoning per dimension and emits whole lines.
+
+    Four dimension agents stream concurrently under asyncio.gather. Printing
+    deltas straight through interleaves them mid-word and the output is
+    unreadable, so each dimension accumulates until it has a newline, then emits
+    one labelled line. Call flush() at the end or the last partial line — often
+    the conclusion — is lost.
+
+    asyncio is single-threaded and all four agents run on the same loop, so the
+    plain dict needs no lock. Same reasoning as usage.py's _totals.
+    """
+
+    def __init__(self, stream=None):
+        self._buffers: dict[str, str] = {}
+        self._stream = stream
+
+    def emit(self, dimension: str, delta: str) -> None:
+        buf = self._buffers.get(dimension, "") + delta
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            if line.strip():
+                print(f"[THINKING — {dimension.upper()}] {line.strip()}",
+                      file=self._stream, flush=True)
+        self._buffers[dimension] = buf
+
+    def flush(self) -> None:
+        for dimension, buf in self._buffers.items():
+            if buf.strip():
+                print(f"[THINKING — {dimension.upper()}] {buf.strip()}",
+                      file=self._stream, flush=True)
+        self._buffers.clear()
+
+
+async def run_dimension_agent(
+    dimension: str,
+    user_id: str,
+    verbose: bool = False,
+    thinking: bool = True,
+    on_thinking: Callable[[str, str], None] | None = None,
+) -> dict:
     """
     Run one dimension scoring agent. Opens its own MCP session, fetches data,
     scores its dimension, and returns a structured result via report_dimension_score.
     When thinking=True, adaptive thinking is enabled — Claude reasons step-by-step
     before scoring, and returns a summary of that reasoning, making the logic auditable.
+
+    The reasoning is streamed rather than reported after the fact. `on_thinking`
+    receives (dimension, delta) for each reasoning fragment as it arrives; pass
+    ThinkingPrinter().emit for the terminal, or a queue push to forward it over
+    SSE. When it is None and verbose is set, a printer is created locally.
     """
     system_prompt = _build_system_prompt(load_skill(f"risk-{dimension}"))
     messages      = [{"role": "user", "content": f"Score the {dimension} risk dimension for user {user_id}."}]
@@ -814,6 +917,23 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
     cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
     score_result  = None
     tools_called: list[str] = []
+
+    # The only place in this file that asks what the provider can do. Absent
+    # thinking support, `thinking=True` would return a perfectly good score with
+    # an empty [THINKING] section and no error — the one failure mode a caller
+    # cannot see. Degrade out loud instead: keep the reasoning depth, which every
+    # provider here honours, and say the audit trail is gone.
+    emit_thinking = thinking and supports("thinking_blocks")
+    if thinking and not emit_thinking:
+        print(
+            f"[NOTE] This provider returns no thinking blocks — scoring "
+            f"{dimension} at effort=high with no reasoning audit trail."
+        )
+
+    # A locally-owned printer is flushed here; a caller-supplied sink is the
+    # caller's to flush, since it may be shared across all four agents.
+    local_printer = ThinkingPrinter() if (on_thinking is None and verbose) else None
+    sink = on_thinking or (local_printer.emit if local_printer else None)
 
     async with start_mcp_session() as session:
         iteration = 0
@@ -828,7 +948,7 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
                 tools      = cached_tools,
                 messages   = messages,
             )
-            if thinking:
+            if emit_thinking:
                 # Adaptive thinking — Claude picks the depth per request instead of
                 # spending a fixed budget. display="summarized" is required: the
                 # default is "omitted", which returns thinking blocks with empty text
@@ -838,19 +958,35 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
                 # other value.
                 create_kwargs["thinking"]      = {"type": "adaptive", "display": "summarized"}
                 create_kwargs["output_config"] = {"effort": "high"}
+            elif thinking:
+                # Effort without traces. temperature is safe to send here: the
+                # temperature=1 constraint belongs to Anthropic extended thinking,
+                # which is not in play on this path.
+                create_kwargs["output_config"] = {"effort": "high"}
+                create_kwargs["temperature"]   = TEMPERATURE
             else:
                 create_kwargs["temperature"] = TEMPERATURE
 
-            response = await client.messages.create(**create_kwargs)
+            # Streamed, not awaited whole: the reasoning is the slow part and the
+            # only part worth watching. `event.type` is "thinking" or "text" on
+            # both providers — Anthropic synthesises those events natively, and
+            # openai_compat_client emits the same two shapes from
+            # reasoning_content. No provider branch.
+            async with client.messages.stream(**create_kwargs) as stream:
+                async for event in stream:
+                    if event.type == "thinking" and sink:
+                        sink(dimension, event.thinking)
+                response = await stream.get_final_message()
             log_usage(response, f"run_dimension_agent/{dimension}")
 
             tool_results = []
             for block in response.content:
-                if block.type == "thinking":
-                    if verbose:
-                        print(f"\n[THINKING — {dimension.upper()}]\n{block.thinking}\n")
-
-                elif block.type == "tool_use":
+                # Thinking blocks are still in response.content and still go back
+                # into `messages` below — required for multi-turn correctness.
+                # They are NOT printed here: the streaming loop above already
+                # emitted every delta, and printing the assembled block too would
+                # duplicate the whole trace.
+                if block.type == "tool_use":
                     if block.name == "report_dimension_score":
                         score_result = block.input
                         tool_results.append({
@@ -874,6 +1010,9 @@ async def run_dimension_agent(dimension: str, user_id: str, verbose: bool = Fals
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
                 _cache_conversation(messages)
+
+    if local_printer:
+        local_printer.flush()
 
     return score_result or {"score": 0, "max_score": 0, "factors": [], "evidence": []}, tools_called
 
@@ -961,11 +1100,18 @@ def _synthesize_risk_report(user_id: str, auth: dict, perms: dict, behav: dict, 
     return "\n".join(lines)
 
 
-async def run_flow_parallel_risk_with_memory(user_id: str, verbose: bool = True) -> str:
+async def run_flow_parallel_risk_with_memory(
+    user_id: str,
+    verbose: bool = True,
+    on_thinking: Callable[[str, str], None] | None = None,
+) -> str:
     """
-    Option 8: parallel agents + extended thinking + memory.
+    Option 9: parallel agents + extended thinking + memory.
     Fetches the prior assessment before launching agents, synthesizes a delta
     comparison, then saves the new result — all via MCP, all Python-driven.
+
+    `on_thinking(dimension, delta)` streams the agents' reasoning; see
+    run_flow_parallel_risk for why one sink is shared across all four.
     """
     if verbose:
         print(f"\n{'='*60}")
@@ -986,12 +1132,18 @@ async def run_flow_parallel_risk_with_memory(user_id: str, verbose: bool = True)
         print("[AGENTS] Launching 4 dimension agents concurrently...\n")
 
     # Step 2 — parallel agents with extended thinking
+    printer = ThinkingPrinter() if (on_thinking is None and verbose) else None
+    sink    = on_thinking or (printer.emit if printer else None)
+
     (auth, _), (perms, _), (behav, _), (acct, _) = await asyncio.gather(
-        run_dimension_agent("auth",        user_id, verbose, thinking=True),
-        run_dimension_agent("permissions", user_id, verbose, thinking=True),
-        run_dimension_agent("behaviour",   user_id, verbose, thinking=True),
-        run_dimension_agent("account",     user_id, verbose, thinking=True),
+        run_dimension_agent("auth",        user_id, verbose, True, sink),
+        run_dimension_agent("permissions", user_id, verbose, True, sink),
+        run_dimension_agent("behaviour",   user_id, verbose, True, sink),
+        run_dimension_agent("account",     user_id, verbose, True, sink),
     )
+
+    if printer:
+        printer.flush()
 
     if verbose:
         print("\n[AGENTS] All 4 agents complete. Synthesizing...\n")
@@ -1030,12 +1182,21 @@ async def run_flow_parallel_risk_with_memory(user_id: str, verbose: bool = True)
 
 
 async def run_flow_parallel_risk(
-    user_id: str, verbose: bool = True, thinking: bool = False
+    user_id: str,
+    verbose: bool = True,
+    thinking: bool = False,
+    on_thinking: Callable[[str, str], None] | None = None,
 ) -> tuple[str, list[str]]:
     """
     Fan out to 4 independent Claude agents — one per risk dimension.
     thinking=False (default for option 7) — faster, no extended thinking.
     thinking=True  (option 8) — slower, but reasoning is auditable.
+
+    `on_thinking(dimension, delta)` receives streamed reasoning from all four
+    agents. One sink is shared across them deliberately: the dimension label is
+    what makes four interleaved traces readable, so the sink needs to see all of
+    them to interleave coherently. Left None with verbose set, a ThinkingPrinter
+    is created here and flushed after the agents finish.
 
     Returns (report, tools_called) — the flat list of tool names across all
     four agents. Note run_flow_parallel_risk_with_memory() returns the report
@@ -1047,15 +1208,21 @@ async def run_flow_parallel_risk(
         print("[AGENTS] Launching 4 dimension agents concurrently...")
         print("         auth | permissions | behaviour | account\n")
 
+    printer = ThinkingPrinter() if (on_thinking is None and verbose and thinking) else None
+    sink    = on_thinking or (printer.emit if printer else None)
+
     (auth, auth_tools), (perms, perms_tools), (behav, behav_tools), (acct, acct_tools) = \
         await asyncio.gather(
-            run_dimension_agent("auth",        user_id, verbose, thinking),
-            run_dimension_agent("permissions", user_id, verbose, thinking),
-            run_dimension_agent("behaviour",   user_id, verbose, thinking),
-            run_dimension_agent("account",     user_id, verbose, thinking),
+            run_dimension_agent("auth",        user_id, verbose, thinking, sink),
+            run_dimension_agent("permissions", user_id, verbose, thinking, sink),
+            run_dimension_agent("behaviour",   user_id, verbose, thinking, sink),
+            run_dimension_agent("account",     user_id, verbose, thinking, sink),
         )
 
     all_tools = auth_tools + perms_tools + behav_tools + acct_tools
+
+    if printer:
+        printer.flush()
 
     if verbose:
         print("\n[AGENTS] All 4 agents complete. Synthesizing...\n")
